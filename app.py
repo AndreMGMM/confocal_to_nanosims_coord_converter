@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image, ImageDraw, ImageSequence
+from PIL import Image, ImageDraw, ImageFont, ImageSequence
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 
@@ -22,6 +22,7 @@ LUTS = {
 }
 
 
+# ----------------------------- math helpers -----------------------------
 def affine_from_points(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     if src.shape != dst.shape or src.shape[0] < 3:
         raise ValueError("Need at least 3 matching source and destination points.")
@@ -58,6 +59,7 @@ def fmt(v: Optional[float], digits: int = 9) -> str:
     return "" if v is None else f"{v:.{digits}f}"
 
 
+# ----------------------------- image helpers -----------------------------
 def image_to_channel_arrays(img: Image.Image, max_channels: int = 2) -> List[np.ndarray]:
     channels: List[np.ndarray] = []
     for frame in ImageSequence.Iterator(img):
@@ -99,6 +101,8 @@ def load_uploaded_images(files, zip_file) -> Dict[str, bytes]:
     if files:
         for f in files:
             data = f.read()
+            # Store both the uploaded path and only the basename. This lets JSONs
+            # with Windows paths still match uploaded browser files.
             image_bytes[f.name] = data
             image_bytes[Path(f.name).name] = data
     if zip_file is not None:
@@ -117,8 +121,7 @@ def load_uploaded_images(files, zip_file) -> Dict[str, bytes]:
 def find_tile_bytes(raw_path: str, image_bytes: Dict[str, bytes]) -> Optional[bytes]:
     if raw_path in image_bytes:
         return image_bytes[raw_path]
-    name = Path(raw_path).name
-    return image_bytes.get(name)
+    return image_bytes.get(Path(raw_path).name)
 
 
 def default_channel_settings(data: dict, image_bytes: Dict[str, bytes]) -> List[dict]:
@@ -149,7 +152,7 @@ def default_channel_settings(data: dict, image_bytes: Dict[str, bytes]) -> List[
     return settings
 
 
-def build_overview(data: dict, image_bytes: Dict[str, bytes], channel_settings: List[dict], anchors: List[dict], positions: Dict[str, dict], stage_to_mosaic_A: Optional[np.ndarray]) -> Tuple[Image.Image, int, int]:
+def build_base_overview(data: dict, image_bytes: Dict[str, bytes], channel_settings: List[dict]) -> Tuple[Image.Image, int, int]:
     mosaic = data.get("mosaic") or {}
     tiles = mosaic.get("tiles") or []
     size = mosaic.get("size") or [1200, 900]
@@ -157,9 +160,11 @@ def build_overview(data: dict, image_bytes: Dict[str, bytes], channel_settings: 
         width, height = int(size[0]), int(size[1])
     except Exception:
         width, height = 1200, 900
+
     overview = Image.new("RGB", (max(width, 1), max(height, 1)), (18, 18, 18))
     loaded = 0
     missing = 0
+
     for tile in tiles:
         raw = tile.get("path")
         b = find_tile_bytes(raw, image_bytes) if raw else None
@@ -175,29 +180,82 @@ def build_overview(data: dict, image_bytes: Dict[str, bytes], channel_settings: 
             loaded += 1
         except Exception:
             missing += 1
-    draw = ImageDraw.Draw(overview)
+
     if loaded == 0:
+        draw = ImageDraw.Draw(overview)
         draw.text((24, 24), "No image tiles found. Upload tiles or a ZIP containing them.", fill=(220, 220, 220))
-    # Draw positions from JSON affine
-    if stage_to_mosaic_A is not None:
+    return overview, loaded, missing
+
+
+def safe_font(size: int):
+    try:
+        return ImageFont.truetype("DejaVuSans-Bold.ttf", size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def make_display_overview(
+    base: Image.Image,
+    scale: float,
+    anchors: List[dict],
+    pending_anchor: Optional[dict],
+    positions: Dict[str, dict],
+    stage_to_mosaic_A: Optional[np.ndarray],
+    show_positions: bool,
+    show_anchor_labels: bool,
+) -> Image.Image:
+    """Resize overview for display, then draw overlays at display scale.
+
+    Drawing after resizing makes anchors visible even when zoomed far out.
+    Click coordinates from streamlit-image-coordinates are then converted back
+    to original mosaic pixels by dividing by the same scale.
+    """
+    scale = max(0.05, min(float(scale), 4.0))
+    w = max(1, int(round(base.width * scale)))
+    h = max(1, int(round(base.height * scale)))
+    display = base.resize((w, h), Image.Resampling.BILINEAR).convert("RGB")
+    draw = ImageDraw.Draw(display)
+
+    marker_r = max(6, int(round(8 * scale)))
+    line_w = max(2, int(round(3 * scale)))
+    font = safe_font(max(12, int(round(14 * scale))))
+
+    if show_positions and stage_to_mosaic_A is not None:
+        pos_r = max(3, int(round(5 * scale)))
         for pid, pos in positions.items():
             stage = pos.get("stage")
             if stage is None:
                 continue
-            x, y = apply_affine(stage_to_mosaic_A, stage)
-            r = 5
-            draw.ellipse((x - r, y - r, x + r, y + r), outline=(80, 213, 255), width=2)
-            draw.text((x + 8, y - 14), str(pid), fill=(232, 251, 255))
-    # Draw anchors
+            x0, y0 = apply_affine(stage_to_mosaic_A, stage)
+            x, y = x0 * scale, y0 * scale
+            draw.ellipse((x - pos_r, y - pos_r, x + pos_r, y + pos_r), outline=(80, 213, 255), width=max(1, line_w - 1))
+            if scale >= 0.35:
+                draw.text((x + pos_r + 3, y - pos_r - 6), str(pid), fill=(232, 251, 255), font=font)
+
+    # Existing anchors: bright filled circles + cross + label.
     for i, anchor in enumerate(anchors, start=1):
-        x, y = anchor["mosaic"]
-        r = 8
-        draw.line((x - r, y, x + r, y), fill=(255, 207, 74), width=2)
-        draw.line((x, y - r, x, y + r), fill=(255, 207, 74), width=2)
-        draw.text((x + 10, y + 8), f"A{i}", fill=(255, 235, 156))
-    return overview, loaded, missing
+        x0, y0 = anchor["mosaic"]
+        x, y = x0 * scale, y0 * scale
+        draw.ellipse((x - marker_r, y - marker_r, x + marker_r, y + marker_r), fill=(255, 207, 74), outline=(0, 0, 0), width=line_w)
+        draw.line((x - marker_r * 1.8, y, x + marker_r * 1.8, y), fill=(255, 255, 255), width=line_w)
+        draw.line((x, y - marker_r * 1.8, x, y + marker_r * 1.8), fill=(255, 255, 255), width=line_w)
+        if show_anchor_labels:
+            draw.text((x + marker_r + 6, y + marker_r + 2), f"A{i}", fill=(255, 255, 255), font=font)
+
+    # Pending anchor: magenta ring so it is obvious before clicking Add anchor.
+    if pending_anchor is not None:
+        x0, y0 = pending_anchor["mosaic"]
+        x, y = x0 * scale, y0 * scale
+        r = marker_r + 4
+        draw.ellipse((x - r, y - r, x + r, y + r), outline=(255, 0, 255), width=max(3, line_w))
+        draw.line((x - r * 1.6, y, x + r * 1.6, y), fill=(255, 0, 255), width=max(2, line_w - 1))
+        draw.line((x, y - r * 1.6, x, y + r * 1.6), fill=(255, 0, 255), width=max(2, line_w - 1))
+        draw.text((x + r + 6, y - r), "pending", fill=(255, 0, 255), font=font)
+
+    return display
 
 
+# ----------------------------- JSON helpers -----------------------------
 def parse_positions(data: dict) -> Dict[str, dict]:
     positions: Dict[str, dict] = {}
     entries = (data.get("positions") or {}).get("entries") or {}
@@ -264,20 +322,42 @@ def make_output_json(data: dict, anchors: List[dict], positions: Dict[str, dict]
     return json.dumps(out, indent=2)
 
 
+# ----------------------------- app -----------------------------
 st.set_page_config(page_title="NanoSIMS Converter", layout="wide")
 st.title("Overview to NanoSIMS Converter")
-st.caption("Browser/Replit version of the Tkinter converter")
+st.caption("Streamlit/browser version with visible anchors and overview zoom controls")
 
 if "anchors" not in st.session_state:
     st.session_state.anchors = []
+if "pending_anchor" not in st.session_state:
+    st.session_state.pending_anchor = None
 
 with st.sidebar:
     st.header("1. Upload files")
     json_file = st.file_uploader("Mapping JSON", type=["json"])
-    tile_files = st.file_uploader("Image tiles", type=["png", "jpg", "jpeg", "tif", "tiff", "bmp"], accept_multiple_files=True)
+    tile_files = st.file_uploader(
+        "Image tiles",
+        type=["png", "jpg", "jpeg", "tif", "tiff", "bmp"],
+        accept_multiple_files=True,
+    )
     zip_file = st.file_uploader("Or ZIP containing image tiles", type=["zip"])
-    st.header("2. Display")
-    st.write("Upload JSON and tile files first. Then click the image to place anchors.")
+
+    st.header("2. Overview display")
+    zoom_percent = st.slider("Zoom", min_value=10, max_value=200, value=70, step=5, help="Lower values zoom out; higher values zoom in.")
+    show_positions = st.checkbox("Show sample positions", value=True)
+    show_anchor_labels = st.checkbox("Show anchor labels", value=True)
+    if st.button("Reset zoom to 70%"):
+        st.session_state["zoom_reset_dummy"] = st.session_state.get("zoom_reset_dummy", 0) + 1
+        st.rerun()
+
+    st.header("3. Anchor controls")
+    if st.button("Clear anchors"):
+        st.session_state.anchors = []
+        st.session_state.pending_anchor = None
+        st.rerun()
+    if st.button("Clear pending click"):
+        st.session_state.pending_anchor = None
+        st.rerun()
 
 if json_file is None:
     st.info("Upload your mapping JSON to start.")
@@ -303,7 +383,7 @@ if mosaic_to_stage_A is None:
 
 channel_defaults = default_channel_settings(data, image_bytes)
 with st.sidebar:
-    st.header("3. Colors")
+    st.header("4. Colors")
     channel_settings = []
     for i, default in enumerate(channel_defaults, start=1):
         with st.expander(f"Channel {i}", expanded=False):
@@ -312,22 +392,37 @@ with st.sidebar:
             hi = st.number_input("Max", value=float(default["max"]), key=f"ch{i}_max", format="%.6f")
             lut = st.selectbox("LUT", list(LUTS.keys()), index=list(LUTS.keys()).index(default["lut"]), key=f"ch{i}_lut")
             channel_settings.append({"enabled": enabled, "min": lo, "max": hi, "lut": lut})
-    if st.button("Clear anchors"):
-        st.session_state.anchors = []
-        st.rerun()
 
 stage_to_nanosims_A, positions = compute_nanosims(st.session_state.anchors, positions)
-overview, loaded, missing = build_overview(data, image_bytes, channel_settings, st.session_state.anchors, positions, stage_to_mosaic_A)
+base_overview, loaded, missing = build_base_overview(data, image_bytes, channel_settings)
+scale = zoom_percent / 100.0
+shown_overview = make_display_overview(
+    base=base_overview,
+    scale=scale,
+    anchors=st.session_state.anchors,
+    pending_anchor=st.session_state.pending_anchor,
+    positions=positions,
+    stage_to_mosaic_A=stage_to_mosaic_A,
+    show_positions=show_positions,
+    show_anchor_labels=show_anchor_labels,
+)
 
 left, right = st.columns([2, 1])
 with left:
     st.subheader("Overview")
-    st.write(f"Tiles loaded: **{loaded}**; missing: **{missing}**. Click the image to select an anchor location.")
-    click = streamlit_image_coordinates(overview, key="overview_click")
+    st.write(
+        f"Tiles loaded: **{loaded}**; missing: **{missing}**. "
+        f"Original overview: **{base_overview.width} × {base_overview.height} px**. "
+        f"Display zoom: **{zoom_percent}%**."
+    )
+    st.caption("Click the displayed overview to choose an anchor. The click is converted back to original mosaic pixels automatically.")
+    click = streamlit_image_coordinates(shown_overview, key=f"overview_click_{zoom_percent}_{len(st.session_state.anchors)}")
     if click is not None:
-        uv = (float(click["x"]), float(click["y"]))
+        # Convert from displayed-image pixels back to original mosaic pixels.
+        uv = (float(click["x"]) / scale, float(click["y"]) / scale)
         stage = apply_affine(mosaic_to_stage_A, uv)
         st.session_state.pending_anchor = {"mosaic": uv, "stage": stage}
+        st.rerun()
 
 with right:
     st.subheader("Add NanoSIMS anchor")
@@ -340,22 +435,28 @@ with right:
         nx = st.number_input("NanoSIMS X", value=0.0, format="%.6f")
         ny = st.number_input("NanoSIMS Y", value=0.0, format="%.6f")
         if st.button("Add anchor"):
-            st.session_state.anchors.append({"mosaic": pending["mosaic"], "stage": pending["stage"], "nanosims": (float(nx), float(ny))})
+            st.session_state.anchors.append(
+                {"mosaic": pending["mosaic"], "stage": pending["stage"], "nanosims": (float(nx), float(ny))}
+            )
             st.session_state.pending_anchor = None
             st.rerun()
 
     st.subheader("Anchors")
     if st.session_state.anchors:
-        anchor_df = pd.DataFrame([
-            {
-                "Anchor": f"A{i}",
-                "Confocal X (m)": fmt(a["stage"][0]),
-                "Confocal Y (m)": fmt(a["stage"][1]),
-                "NanoSIMS X": fmt(a["nanosims"][0], 6),
-                "NanoSIMS Y": fmt(a["nanosims"][1], 6),
-            }
-            for i, a in enumerate(st.session_state.anchors, start=1)
-        ])
+        anchor_df = pd.DataFrame(
+            [
+                {
+                    "Anchor": f"A{i}",
+                    "Mosaic X": fmt(a["mosaic"][0], 2),
+                    "Mosaic Y": fmt(a["mosaic"][1], 2),
+                    "Confocal X (m)": fmt(a["stage"][0]),
+                    "Confocal Y (m)": fmt(a["stage"][1]),
+                    "NanoSIMS X": fmt(a["nanosims"][0], 6),
+                    "NanoSIMS Y": fmt(a["nanosims"][1], 6),
+                }
+                for i, a in enumerate(st.session_state.anchors, start=1)
+            ]
+        )
         st.dataframe(anchor_df, use_container_width=True, hide_index=True)
         remove = st.number_input("Delete anchor number", min_value=1, max_value=len(st.session_state.anchors), value=1, step=1)
         if st.button("Delete selected anchor"):
@@ -370,14 +471,16 @@ for pid in sorted(positions):
     pos = positions[pid]
     stage = pos.get("stage")
     nano = pos.get("nano")
-    rows.append({
-        "ID": pid,
-        "Confocal X (m)": fmt(stage[0] if stage else None),
-        "Confocal Y (m)": fmt(stage[1] if stage else None),
-        "Z (m)": fmt(pos.get("z")),
-        "NanoSIMS X": fmt(nano[0] if nano else None, 6),
-        "NanoSIMS Y": fmt(nano[1] if nano else None, 6),
-    })
+    rows.append(
+        {
+            "ID": pid,
+            "Confocal X (m)": fmt(stage[0] if stage else None),
+            "Confocal Y (m)": fmt(stage[1] if stage else None),
+            "Z (m)": fmt(pos.get("z")),
+            "NanoSIMS X": fmt(nano[0] if nano else None, 6),
+            "NanoSIMS Y": fmt(nano[1] if nano else None, 6),
+        }
+    )
 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 if len(st.session_state.anchors) < 3:

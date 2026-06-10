@@ -1,8 +1,28 @@
 # Confocal to NanoSIMS Coordinate Converter
 
-A Streamlit web app for converting confocal overview/sample coordinates into NanoSIMS coordinates.
+A Streamlit web app for converting confocal overview/sample coordinates into NanoSIMS coordinate space.
 
-The app loads a mapping JSON and associated image tiles, reconstructs an overview image, lets the user define matching NanoSIMS anchor points, computes an affine transformation, and exports an updated JSON file containing converted NanoSIMS positions.
+## Features
+
+- Upload a mapping JSON file.
+- Upload image tiles individually or as a ZIP archive.
+- Reconstruct the overview mosaic image.
+- Adjust two-channel color display.
+- Zoom the overview in/out.
+- Click overview features to place anchor points.
+- Display anchors directly on the overview image.
+- Compute an affine transform from at least three NanoSIMS anchors.
+- Export an updated JSON file with `nanosims_off` coordinates.
+
+## Deploy on Streamlit Community Cloud
+
+Use these settings:
+
+```text
+Repository: your GitHub repository URL
+Branch: main or the branch shown on GitHub
+Main file path: app.py
+```
 
 ## Run locally
 
@@ -10,20 +30,3 @@ The app loads a mapping JSON and associated image tiles, reconstructs an overvie
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-## Deploy on Streamlit Community Cloud
-
-Use these settings:
-
-- Repository: your GitHub repository URL
-- Branch: `main` or the branch shown on GitHub
-- Main file path: `app.py`
-
-## How to use
-
-1. Upload the mapping JSON.
-2. Upload the image tiles individually, or upload a ZIP containing the tiles.
-3. Click the overview image to choose an anchor point.
-4. Enter the matching NanoSIMS X/Y coordinates.
-5. Add at least 3 anchors.
-6. Download the converted JSON.
