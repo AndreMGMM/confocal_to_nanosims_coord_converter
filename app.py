@@ -385,7 +385,7 @@ def cached_build_overview_png(
 # ----------------------------- app -----------------------------
 st.set_page_config(page_title="NanoSIMS Converter", layout="wide")
 st.title("Overview to NanoSIMS Converter")
-st.caption("Streamlit/browser version with cached previews, visible anchors, and zoom controls")
+st.caption("Streamlit/browser version with stable anchor clicks, cached previews, visible anchors, and zoom controls")
 
 if "anchors" not in st.session_state:
     st.session_state.anchors = []
@@ -395,6 +395,8 @@ if "channel_settings" not in st.session_state:
     st.session_state.channel_settings = None
 if "loaded_signature" not in st.session_state:
     st.session_state.loaded_signature = None
+if "last_click_xy" not in st.session_state:
+    st.session_state.last_click_xy = None
 
 with st.sidebar:
     st.header("1. Upload files")
@@ -424,6 +426,7 @@ with st.sidebar:
         st.rerun()
     if st.button("Clear pending click"):
         st.session_state.pending_anchor = None
+        st.session_state.last_click_xy = None
         st.rerun()
 
 if json_file is None:
@@ -514,15 +517,20 @@ with left:
         f"Preview image: **{base_overview.width} × {base_overview.height} px** "
         f"({preview_percent}% resolution). Display zoom: **{zoom_percent}%**."
     )
-    st.caption("Click the displayed overview to choose an anchor. The click is converted back to original mosaic pixels automatically.")
-    click = streamlit_image_coordinates(shown_overview, key=f"overview_click_{preview_percent}_{zoom_percent}_{len(st.session_state.anchors)}")
+    st.caption("Click the displayed overview to choose an anchor. After clicking, enter NanoSIMS X/Y in the panel on the right, then press Add anchor.")
+    click = streamlit_image_coordinates(shown_overview, key="overview_click_stable")
     if click is not None:
         # Convert from displayed-image pixels back to original full-resolution mosaic pixels.
+        # Do NOT call st.rerun() here. Some Streamlit image-click components return
+        # the last click again after every rerun, which can cause a refresh loop and
+        # prevent the NanoSIMS coordinate fields from appearing.
+        click_xy = (int(click["x"]), int(click["y"]))
         display_to_original = max(preview_factor * scale, 1e-12)
         uv = (float(click["x"]) / display_to_original, float(click["y"]) / display_to_original)
         stage = apply_affine(mosaic_to_stage_A, uv)
         st.session_state.pending_anchor = {"mosaic": uv, "stage": stage}
-        st.rerun()
+        st.session_state.last_click_xy = click_xy
+        st.success(f"Anchor point selected at mosaic x={uv[0]:.2f}, y={uv[1]:.2f}. Now enter NanoSIMS X/Y on the right.")
 
 with right:
     st.subheader("Add NanoSIMS anchor")
@@ -532,13 +540,14 @@ with right:
     else:
         st.write(f"Clicked mosaic: x={pending['mosaic'][0]:.2f}, y={pending['mosaic'][1]:.2f}")
         st.write(f"Confocal stage: x={pending['stage'][0]:.9f}, y={pending['stage'][1]:.9f}")
-        nx = st.number_input("NanoSIMS X", value=0.0, format="%.6f")
-        ny = st.number_input("NanoSIMS Y", value=0.0, format="%.6f")
-        if st.button("Add anchor"):
+        nx = st.number_input("NanoSIMS X", value=0.0, format="%.6f", key="pending_nanosims_x")
+        ny = st.number_input("NanoSIMS Y", value=0.0, format="%.6f", key="pending_nanosims_y")
+        if st.button("Add anchor", type="primary"):
             st.session_state.anchors.append(
                 {"mosaic": pending["mosaic"], "stage": pending["stage"], "nanosims": (float(nx), float(ny))}
             )
             st.session_state.pending_anchor = None
+            st.session_state.last_click_xy = None
             st.rerun()
 
     st.subheader("Anchors")
