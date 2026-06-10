@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import zipfile
@@ -152,16 +153,29 @@ def default_channel_settings(data: dict, image_bytes: Dict[str, bytes]) -> List[
     return settings
 
 
-def build_base_overview(data: dict, image_bytes: Dict[str, bytes], channel_settings: List[dict]) -> Tuple[Image.Image, int, int]:
+def build_base_overview(
+    data: dict,
+    image_bytes: Dict[str, bytes],
+    channel_settings: List[dict],
+    preview_factor: float = 1.0,
+) -> Tuple[Image.Image, int, int]:
+    """Build the overview image.
+
+    preview_factor < 1 makes a smaller overview for speed. All anchor math still
+    uses original mosaic coordinates; display/click conversion accounts for this.
+    """
+    preview_factor = max(0.05, min(float(preview_factor), 1.0))
     mosaic = data.get("mosaic") or {}
     tiles = mosaic.get("tiles") or []
     size = mosaic.get("size") or [1200, 900]
     try:
-        width, height = int(size[0]), int(size[1])
+        orig_width, orig_height = int(size[0]), int(size[1])
     except Exception:
-        width, height = 1200, 900
+        orig_width, orig_height = 1200, 900
 
-    overview = Image.new("RGB", (max(width, 1), max(height, 1)), (18, 18, 18))
+    width = max(1, int(round(orig_width * preview_factor)))
+    height = max(1, int(round(orig_height * preview_factor)))
+    overview = Image.new("RGB", (width, height), (18, 18, 18))
     loaded = 0
     missing = 0
 
@@ -174,8 +188,13 @@ def build_base_overview(data: dict, image_bytes: Dict[str, bytes], channel_setti
         try:
             img = Image.open(io.BytesIO(b))
             comp = composite_to_rgb(img, channel_settings)
-            ox = int(tile.get("offset_x", tile.get("ox", 0)))
-            oy = int(tile.get("offset_y", tile.get("oy", 0)))
+            if preview_factor != 1.0:
+                comp = comp.resize(
+                    (max(1, int(round(comp.width * preview_factor))), max(1, int(round(comp.height * preview_factor)))),
+                    Image.Resampling.BILINEAR,
+                )
+            ox = int(round(int(tile.get("offset_x", tile.get("ox", 0))) * preview_factor))
+            oy = int(round(int(tile.get("offset_y", tile.get("oy", 0))) * preview_factor))
             overview.paste(comp, (ox, oy))
             loaded += 1
         except Exception:
@@ -197,6 +216,7 @@ def safe_font(size: int):
 def make_display_overview(
     base: Image.Image,
     scale: float,
+    coord_scale: float,
     anchors: List[dict],
     pending_anchor: Optional[dict],
     positions: Dict[str, dict],
@@ -227,7 +247,7 @@ def make_display_overview(
             if stage is None:
                 continue
             x0, y0 = apply_affine(stage_to_mosaic_A, stage)
-            x, y = x0 * scale, y0 * scale
+            x, y = x0 * coord_scale * scale, y0 * coord_scale * scale
             draw.ellipse((x - pos_r, y - pos_r, x + pos_r, y + pos_r), outline=(80, 213, 255), width=max(1, line_w - 1))
             if scale >= 0.35:
                 draw.text((x + pos_r + 3, y - pos_r - 6), str(pid), fill=(232, 251, 255), font=font)
@@ -235,7 +255,7 @@ def make_display_overview(
     # Existing anchors: bright filled circles + cross + label.
     for i, anchor in enumerate(anchors, start=1):
         x0, y0 = anchor["mosaic"]
-        x, y = x0 * scale, y0 * scale
+        x, y = x0 * coord_scale * scale, y0 * coord_scale * scale
         draw.ellipse((x - marker_r, y - marker_r, x + marker_r, y + marker_r), fill=(255, 207, 74), outline=(0, 0, 0), width=line_w)
         draw.line((x - marker_r * 1.8, y, x + marker_r * 1.8, y), fill=(255, 255, 255), width=line_w)
         draw.line((x, y - marker_r * 1.8, x, y + marker_r * 1.8), fill=(255, 255, 255), width=line_w)
@@ -245,7 +265,7 @@ def make_display_overview(
     # Pending anchor: magenta ring so it is obvious before clicking Add anchor.
     if pending_anchor is not None:
         x0, y0 = pending_anchor["mosaic"]
-        x, y = x0 * scale, y0 * scale
+        x, y = x0 * coord_scale * scale, y0 * coord_scale * scale
         r = marker_r + 4
         draw.ellipse((x - r, y - r, x + r, y + r), outline=(255, 0, 255), width=max(3, line_w))
         draw.line((x - r * 1.6, y, x + r * 1.6, y), fill=(255, 0, 255), width=max(2, line_w - 1))
@@ -322,15 +342,59 @@ def make_output_json(data: dict, anchors: List[dict], positions: Dict[str, dict]
     return json.dumps(out, indent=2)
 
 
+
+# ----------------------------- cache/state helpers -----------------------------
+def uploaded_signature(json_bytes: bytes, tile_files, zip_file) -> str:
+    h = hashlib.sha256()
+    h.update(json_bytes)
+    if tile_files:
+        for f in tile_files:
+            h.update(f.name.encode("utf-8", "ignore"))
+            h.update(str(getattr(f, "size", 0)).encode())
+    if zip_file is not None:
+        h.update(zip_file.name.encode("utf-8", "ignore"))
+        h.update(str(getattr(zip_file, "size", 0)).encode())
+    return h.hexdigest()
+
+
+def settings_tuple(settings: List[dict]) -> Tuple[Tuple[bool, float, float, str], ...]:
+    return tuple((bool(s.get("enabled", True)), float(s.get("min", 0.0)), float(s.get("max", 1.0)), str(s.get("lut", "Green"))) for s in settings)
+
+
+@st.cache_data(show_spinner=False)
+def cached_default_channel_settings(data_json: str, image_items: Tuple[Tuple[str, bytes], ...]) -> List[dict]:
+    return default_channel_settings(json.loads(data_json), dict(image_items))
+
+
+@st.cache_data(show_spinner="Building overview image...")
+def cached_build_overview_png(
+    data_json: str,
+    image_items: Tuple[Tuple[str, bytes], ...],
+    settings_items: Tuple[Tuple[bool, float, float, str], ...],
+    preview_factor: float,
+) -> Tuple[bytes, int, int, int, int]:
+    settings = [
+        {"enabled": enabled, "min": lo, "max": hi, "lut": lut}
+        for enabled, lo, hi, lut in settings_items
+    ]
+    overview, loaded, missing = build_base_overview(json.loads(data_json), dict(image_items), settings, preview_factor)
+    buf = io.BytesIO()
+    overview.save(buf, format="PNG")
+    return buf.getvalue(), loaded, missing, overview.width, overview.height
+
 # ----------------------------- app -----------------------------
 st.set_page_config(page_title="NanoSIMS Converter", layout="wide")
 st.title("Overview to NanoSIMS Converter")
-st.caption("Streamlit/browser version with visible anchors and overview zoom controls")
+st.caption("Streamlit/browser version with cached previews, visible anchors, and zoom controls")
 
 if "anchors" not in st.session_state:
     st.session_state.anchors = []
 if "pending_anchor" not in st.session_state:
     st.session_state.pending_anchor = None
+if "channel_settings" not in st.session_state:
+    st.session_state.channel_settings = None
+if "loaded_signature" not in st.session_state:
+    st.session_state.loaded_signature = None
 
 with st.sidebar:
     st.header("1. Upload files")
@@ -343,12 +407,15 @@ with st.sidebar:
     zip_file = st.file_uploader("Or ZIP containing image tiles", type=["zip"])
 
     st.header("2. Overview display")
-    zoom_percent = st.slider("Zoom", min_value=10, max_value=200, value=70, step=5, help="Lower values zoom out; higher values zoom in.")
+    preview_percent = st.select_slider(
+        "Preview resolution",
+        options=[25, 50, 75, 100],
+        value=50,
+        help="Lower values are faster. Anchor math still uses original coordinates.",
+    )
+    zoom_percent = st.slider("Display zoom", min_value=10, max_value=250, value=100, step=5, help="Lower values zoom out; higher values zoom in.")
     show_positions = st.checkbox("Show sample positions", value=True)
     show_anchor_labels = st.checkbox("Show anchor labels", value=True)
-    if st.button("Reset zoom to 70%"):
-        st.session_state["zoom_reset_dummy"] = st.session_state.get("zoom_reset_dummy", 0) + 1
-        st.rerun()
 
     st.header("3. Anchor controls")
     if st.button("Clear anchors"):
@@ -370,6 +437,17 @@ except Exception as exc:
     st.stop()
 
 image_bytes = load_uploaded_images(tile_files, zip_file)
+image_items = tuple(sorted(image_bytes.items(), key=lambda kv: kv[0]))
+data_json = json.dumps(data, sort_keys=True)
+current_signature = uploaded_signature(json_file.getvalue(), tile_files, zip_file)
+
+# Reset only when the input dataset changes, not when color/zoom widgets rerun.
+if st.session_state.loaded_signature != current_signature:
+    st.session_state.loaded_signature = current_signature
+    st.session_state.anchors = []
+    st.session_state.pending_anchor = None
+    st.session_state.channel_settings = cached_default_channel_settings(data_json, image_items)
+
 positions = parse_positions(data)
 try:
     stage_to_mosaic_A, mosaic_to_stage_A = load_affines(data)
@@ -381,24 +459,45 @@ if mosaic_to_stage_A is None:
     st.error("This JSON does not contain a usable affine_A transform, so anchor clicks cannot be converted to confocal coordinates.")
     st.stop()
 
-channel_defaults = default_channel_settings(data, image_bytes)
+if st.session_state.channel_settings is None:
+    st.session_state.channel_settings = cached_default_channel_settings(data_json, image_items)
+
 with st.sidebar:
     st.header("4. Colors")
-    channel_settings = []
-    for i, default in enumerate(channel_defaults, start=1):
-        with st.expander(f"Channel {i}", expanded=False):
-            enabled = st.checkbox("Show", value=default["enabled"], key=f"ch{i}_enabled")
-            lo = st.number_input("Min", value=float(default["min"]), key=f"ch{i}_min", format="%.6f")
-            hi = st.number_input("Max", value=float(default["max"]), key=f"ch{i}_max", format="%.6f")
-            lut = st.selectbox("LUT", list(LUTS.keys()), index=list(LUTS.keys()).index(default["lut"]), key=f"ch{i}_lut")
-            channel_settings.append({"enabled": enabled, "min": lo, "max": hi, "lut": lut})
+    st.caption("Color changes are applied only when you press Apply, so the overview does not rebuild after every small edit.")
+    with st.form("color_form"):
+        edited_settings = []
+        for i, default in enumerate(st.session_state.channel_settings, start=1):
+            st.markdown(f"**Channel {i}**")
+            enabled = st.checkbox("Show", value=bool(default["enabled"]), key=f"form_ch{i}_enabled")
+            lo = st.number_input("Min", value=float(default["min"]), key=f"form_ch{i}_min", format="%.6f")
+            hi = st.number_input("Max", value=float(default["max"]), key=f"form_ch{i}_max", format="%.6f")
+            lut_values = list(LUTS.keys())
+            lut_index = lut_values.index(default.get("lut", "Green")) if default.get("lut", "Green") in lut_values else 0
+            lut = st.selectbox("LUT", lut_values, index=lut_index, key=f"form_ch{i}_lut")
+            edited_settings.append({"enabled": enabled, "min": lo, "max": hi, "lut": lut})
+        apply_colors = st.form_submit_button("Apply color settings")
+    if apply_colors:
+        st.session_state.channel_settings = edited_settings
+        st.session_state.pending_anchor = None
+        st.rerun()
+    if st.button("Reset color ranges"):
+        st.session_state.channel_settings = cached_default_channel_settings(data_json, image_items)
+        st.rerun()
+
+channel_settings = st.session_state.channel_settings
 
 stage_to_nanosims_A, positions = compute_nanosims(st.session_state.anchors, positions)
-base_overview, loaded, missing = build_base_overview(data, image_bytes, channel_settings)
+preview_factor = preview_percent / 100.0
+overview_png, loaded, missing, preview_width, preview_height = cached_build_overview_png(
+    data_json, image_items, settings_tuple(channel_settings), preview_factor
+)
+base_overview = Image.open(io.BytesIO(overview_png)).convert("RGB")
 scale = zoom_percent / 100.0
 shown_overview = make_display_overview(
     base=base_overview,
     scale=scale,
+    coord_scale=preview_factor,
     anchors=st.session_state.anchors,
     pending_anchor=st.session_state.pending_anchor,
     positions=positions,
@@ -412,14 +511,15 @@ with left:
     st.subheader("Overview")
     st.write(
         f"Tiles loaded: **{loaded}**; missing: **{missing}**. "
-        f"Original overview: **{base_overview.width} × {base_overview.height} px**. "
-        f"Display zoom: **{zoom_percent}%**."
+        f"Preview image: **{base_overview.width} × {base_overview.height} px** "
+        f"({preview_percent}% resolution). Display zoom: **{zoom_percent}%**."
     )
     st.caption("Click the displayed overview to choose an anchor. The click is converted back to original mosaic pixels automatically.")
-    click = streamlit_image_coordinates(shown_overview, key=f"overview_click_{zoom_percent}_{len(st.session_state.anchors)}")
+    click = streamlit_image_coordinates(shown_overview, key=f"overview_click_{preview_percent}_{zoom_percent}_{len(st.session_state.anchors)}")
     if click is not None:
-        # Convert from displayed-image pixels back to original mosaic pixels.
-        uv = (float(click["x"]) / scale, float(click["y"]) / scale)
+        # Convert from displayed-image pixels back to original full-resolution mosaic pixels.
+        display_to_original = max(preview_factor * scale, 1e-12)
+        uv = (float(click["x"]) / display_to_original, float(click["y"]) / display_to_original)
         stage = apply_affine(mosaic_to_stage_A, uv)
         st.session_state.pending_anchor = {"mosaic": uv, "stage": stage}
         st.rerun()
