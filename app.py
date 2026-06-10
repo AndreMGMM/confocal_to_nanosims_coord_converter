@@ -1,0 +1,389 @@
+from __future__ import annotations
+
+import copy
+import io
+import json
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image, ImageDraw, ImageSequence
+from streamlit_image_coordinates import streamlit_image_coordinates
+
+
+LUTS = {
+    "Green": (0.0, 1.0, 0.0),
+    "Red": (1.0, 0.0, 0.0),
+    "Blue": (0.0, 0.0, 1.0),
+    "White": (1.0, 1.0, 1.0),
+}
+
+
+def affine_from_points(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    if src.shape != dst.shape or src.shape[0] < 3:
+        raise ValueError("Need at least 3 matching source and destination points.")
+    n = src.shape[0]
+    x = np.zeros((2 * n, 6), dtype=float)
+    b = np.zeros((2 * n,), dtype=float)
+    for i, ((sx, sy), (dx, dy)) in enumerate(zip(src, dst)):
+        x[2 * i, :3] = [sx, sy, 1.0]
+        x[2 * i + 1, 3:] = [sx, sy, 1.0]
+        b[2 * i] = dx
+        b[2 * i + 1] = dy
+    a, *_ = np.linalg.lstsq(x, b, rcond=None)
+    return np.array([[a[0], a[1], a[2]], [a[3], a[4], a[5]]], dtype=float)
+
+
+def apply_affine(a: np.ndarray, xy: Tuple[float, float]) -> Tuple[float, float]:
+    x, y = xy
+    return (
+        float(a[0, 0] * x + a[0, 1] * y + a[0, 2]),
+        float(a[1, 0] * x + a[1, 1] * y + a[1, 2]),
+    )
+
+
+def invert_affine(a: np.ndarray) -> np.ndarray:
+    full = np.array(
+        [[a[0, 0], a[0, 1], a[0, 2]], [a[1, 0], a[1, 1], a[1, 2]], [0.0, 0.0, 1.0]],
+        dtype=float,
+    )
+    inv = np.linalg.inv(full)
+    return inv[:2, :]
+
+
+def fmt(v: Optional[float], digits: int = 9) -> str:
+    return "" if v is None else f"{v:.{digits}f}"
+
+
+def image_to_channel_arrays(img: Image.Image, max_channels: int = 2) -> List[np.ndarray]:
+    channels: List[np.ndarray] = []
+    for frame in ImageSequence.Iterator(img):
+        arr = np.asarray(frame)
+        if arr.ndim == 3 and arr.shape[-1] >= 3:
+            for c in range(min(arr.shape[-1], max_channels - len(channels))):
+                channels.append(arr[..., c].astype(float))
+                if len(channels) >= max_channels:
+                    return channels
+        else:
+            channels.append(arr.astype(float))
+            if len(channels) >= max_channels:
+                return channels
+    return channels
+
+
+def composite_to_rgb(img: Image.Image, channel_settings: List[dict]) -> Image.Image:
+    channels = image_to_channel_arrays(img, max_channels=2)
+    if not channels:
+        return Image.new("RGB", (1, 1), (0, 0, 0))
+    h, w = channels[0].shape[:2]
+    out = np.zeros((h, w, 3), dtype=float)
+    for i, arr in enumerate(channels[:2]):
+        settings = channel_settings[i] if i < len(channel_settings) else {}
+        if not settings.get("enabled", True):
+            continue
+        lo = float(settings.get("min", np.nanpercentile(arr, 1)))
+        hi = float(settings.get("max", np.nanpercentile(arr, 99.8)))
+        lut = LUTS.get(str(settings.get("lut", "Green")), LUTS["Green"])
+        norm = np.clip((arr - lo) / max(hi - lo, 1e-12), 0, 1)
+        for c in range(3):
+            out[..., c] += norm * lut[c]
+    out = np.clip(out, 0, 1)
+    return Image.fromarray((out * 255).astype(np.uint8), "RGB")
+
+
+def load_uploaded_images(files, zip_file) -> Dict[str, bytes]:
+    image_bytes: Dict[str, bytes] = {}
+    if files:
+        for f in files:
+            data = f.read()
+            image_bytes[f.name] = data
+            image_bytes[Path(f.name).name] = data
+    if zip_file is not None:
+        with zipfile.ZipFile(zip_file) as zf:
+            for name in zf.namelist():
+                if name.endswith("/"):
+                    continue
+                suffix = Path(name).suffix.lower()
+                if suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
+                    data = zf.read(name)
+                    image_bytes[name] = data
+                    image_bytes[Path(name).name] = data
+    return image_bytes
+
+
+def find_tile_bytes(raw_path: str, image_bytes: Dict[str, bytes]) -> Optional[bytes]:
+    if raw_path in image_bytes:
+        return image_bytes[raw_path]
+    name = Path(raw_path).name
+    return image_bytes.get(name)
+
+
+def default_channel_settings(data: dict, image_bytes: Dict[str, bytes]) -> List[dict]:
+    mins: List[List[float]] = [[], []]
+    maxs: List[List[float]] = [[], []]
+    for tile in (data.get("mosaic") or {}).get("tiles") or []:
+        raw = tile.get("path")
+        if not raw:
+            continue
+        b = find_tile_bytes(raw, image_bytes)
+        if b is None:
+            continue
+        try:
+            img = Image.open(io.BytesIO(b))
+            channels = image_to_channel_arrays(img, max_channels=2)
+            for i, arr in enumerate(channels[:2]):
+                mins[i].append(float(np.nanpercentile(arr, 1)))
+                maxs[i].append(float(np.nanpercentile(arr, 99.8)))
+        except Exception:
+            continue
+    settings = []
+    for i, lut in enumerate(["Green", "Red"]):
+        lo = min(mins[i]) if mins[i] else 0.0
+        hi = max(maxs[i]) if maxs[i] else 1.0
+        if hi <= lo:
+            hi = lo + 1.0
+        settings.append({"enabled": True, "min": lo, "max": hi, "lut": lut})
+    return settings
+
+
+def build_overview(data: dict, image_bytes: Dict[str, bytes], channel_settings: List[dict], anchors: List[dict], positions: Dict[str, dict], stage_to_mosaic_A: Optional[np.ndarray]) -> Tuple[Image.Image, int, int]:
+    mosaic = data.get("mosaic") or {}
+    tiles = mosaic.get("tiles") or []
+    size = mosaic.get("size") or [1200, 900]
+    try:
+        width, height = int(size[0]), int(size[1])
+    except Exception:
+        width, height = 1200, 900
+    overview = Image.new("RGB", (max(width, 1), max(height, 1)), (18, 18, 18))
+    loaded = 0
+    missing = 0
+    for tile in tiles:
+        raw = tile.get("path")
+        b = find_tile_bytes(raw, image_bytes) if raw else None
+        if b is None:
+            missing += 1
+            continue
+        try:
+            img = Image.open(io.BytesIO(b))
+            comp = composite_to_rgb(img, channel_settings)
+            ox = int(tile.get("offset_x", tile.get("ox", 0)))
+            oy = int(tile.get("offset_y", tile.get("oy", 0)))
+            overview.paste(comp, (ox, oy))
+            loaded += 1
+        except Exception:
+            missing += 1
+    draw = ImageDraw.Draw(overview)
+    if loaded == 0:
+        draw.text((24, 24), "No image tiles found. Upload tiles or a ZIP containing them.", fill=(220, 220, 220))
+    # Draw positions from JSON affine
+    if stage_to_mosaic_A is not None:
+        for pid, pos in positions.items():
+            stage = pos.get("stage")
+            if stage is None:
+                continue
+            x, y = apply_affine(stage_to_mosaic_A, stage)
+            r = 5
+            draw.ellipse((x - r, y - r, x + r, y + r), outline=(80, 213, 255), width=2)
+            draw.text((x + 8, y - 14), str(pid), fill=(232, 251, 255))
+    # Draw anchors
+    for i, anchor in enumerate(anchors, start=1):
+        x, y = anchor["mosaic"]
+        r = 8
+        draw.line((x - r, y, x + r, y), fill=(255, 207, 74), width=2)
+        draw.line((x, y - r, x, y + r), fill=(255, 207, 74), width=2)
+        draw.text((x + 10, y + 8), f"A{i}", fill=(255, 235, 156))
+    return overview, loaded, missing
+
+
+def parse_positions(data: dict) -> Dict[str, dict]:
+    positions: Dict[str, dict] = {}
+    entries = (data.get("positions") or {}).get("entries") or {}
+    for pid, entry in entries.items():
+        coarse = entry.get("coarse_off") or {}
+        try:
+            stage = (float(coarse["x"]), float(coarse["y"]))
+            z = float(coarse.get("z", 0.0))
+        except Exception:
+            stage = None
+            z = None
+        positions[str(pid)] = {"entry": entry, "stage": stage, "z": z, "nano": None}
+    return positions
+
+
+def load_affines(data: dict):
+    stage_to_mosaic_A = None
+    mosaic_to_stage_A = None
+    a = data.get("affine_A")
+    if a is not None:
+        arr = np.array(a, dtype=float)
+        if arr.shape == (2, 3):
+            stage_to_mosaic_A = arr
+            mosaic_to_stage_A = invert_affine(arr)
+    return stage_to_mosaic_A, mosaic_to_stage_A
+
+
+def compute_nanosims(anchors: List[dict], positions: Dict[str, dict]):
+    if len(anchors) < 3:
+        for pos in positions.values():
+            pos["nano"] = None
+        return None, positions
+    src = np.array([a["stage"] for a in anchors], dtype=float)
+    dst = np.array([a["nanosims"] for a in anchors], dtype=float)
+    a = affine_from_points(src, dst)
+    for pos in positions.values():
+        stage = pos.get("stage")
+        pos["nano"] = apply_affine(a, stage) if stage is not None else None
+    return a, positions
+
+
+def make_output_json(data: dict, anchors: List[dict], positions: Dict[str, dict], stage_to_nanosims_A: Optional[np.ndarray]) -> str:
+    out = copy.deepcopy(data)
+    out["nanosims_conversion"] = {
+        "anchors": [
+            {
+                "mosaic": [float(a["mosaic"][0]), float(a["mosaic"][1])],
+                "confocal_stage": [float(a["stage"][0]), float(a["stage"][1])],
+                "nanosims": [float(a["nanosims"][0]), float(a["nanosims"][1])],
+            }
+            for a in anchors
+        ],
+        "stage_to_nanosims_A": stage_to_nanosims_A.tolist() if stage_to_nanosims_A is not None else None,
+    }
+    entries = ((out.get("positions") or {}).get("entries") or {})
+    for pid, pos in positions.items():
+        if pid not in entries:
+            continue
+        nano = pos.get("nano")
+        if nano is None:
+            entries[pid].pop("nanosims_off", None)
+        else:
+            entries[pid]["nanosims_off"] = {"x": float(nano[0]), "y": float(nano[1])}
+    return json.dumps(out, indent=2)
+
+
+st.set_page_config(page_title="NanoSIMS Converter", layout="wide")
+st.title("Overview to NanoSIMS Converter")
+st.caption("Browser/Replit version of the Tkinter converter")
+
+if "anchors" not in st.session_state:
+    st.session_state.anchors = []
+
+with st.sidebar:
+    st.header("1. Upload files")
+    json_file = st.file_uploader("Mapping JSON", type=["json"])
+    tile_files = st.file_uploader("Image tiles", type=["png", "jpg", "jpeg", "tif", "tiff", "bmp"], accept_multiple_files=True)
+    zip_file = st.file_uploader("Or ZIP containing image tiles", type=["zip"])
+    st.header("2. Display")
+    st.write("Upload JSON and tile files first. Then click the image to place anchors.")
+
+if json_file is None:
+    st.info("Upload your mapping JSON to start.")
+    st.stop()
+
+try:
+    data = json.loads(json_file.getvalue().decode("utf-8"))
+except Exception as exc:
+    st.error(f"Could not read JSON: {exc}")
+    st.stop()
+
+image_bytes = load_uploaded_images(tile_files, zip_file)
+positions = parse_positions(data)
+try:
+    stage_to_mosaic_A, mosaic_to_stage_A = load_affines(data)
+except Exception as exc:
+    st.error(f"Could not read affine_A transform: {exc}")
+    st.stop()
+
+if mosaic_to_stage_A is None:
+    st.error("This JSON does not contain a usable affine_A transform, so anchor clicks cannot be converted to confocal coordinates.")
+    st.stop()
+
+channel_defaults = default_channel_settings(data, image_bytes)
+with st.sidebar:
+    st.header("3. Colors")
+    channel_settings = []
+    for i, default in enumerate(channel_defaults, start=1):
+        with st.expander(f"Channel {i}", expanded=False):
+            enabled = st.checkbox("Show", value=default["enabled"], key=f"ch{i}_enabled")
+            lo = st.number_input("Min", value=float(default["min"]), key=f"ch{i}_min", format="%.6f")
+            hi = st.number_input("Max", value=float(default["max"]), key=f"ch{i}_max", format="%.6f")
+            lut = st.selectbox("LUT", list(LUTS.keys()), index=list(LUTS.keys()).index(default["lut"]), key=f"ch{i}_lut")
+            channel_settings.append({"enabled": enabled, "min": lo, "max": hi, "lut": lut})
+    if st.button("Clear anchors"):
+        st.session_state.anchors = []
+        st.rerun()
+
+stage_to_nanosims_A, positions = compute_nanosims(st.session_state.anchors, positions)
+overview, loaded, missing = build_overview(data, image_bytes, channel_settings, st.session_state.anchors, positions, stage_to_mosaic_A)
+
+left, right = st.columns([2, 1])
+with left:
+    st.subheader("Overview")
+    st.write(f"Tiles loaded: **{loaded}**; missing: **{missing}**. Click the image to select an anchor location.")
+    click = streamlit_image_coordinates(overview, key="overview_click")
+    if click is not None:
+        uv = (float(click["x"]), float(click["y"]))
+        stage = apply_affine(mosaic_to_stage_A, uv)
+        st.session_state.pending_anchor = {"mosaic": uv, "stage": stage}
+
+with right:
+    st.subheader("Add NanoSIMS anchor")
+    pending = st.session_state.get("pending_anchor")
+    if pending is None:
+        st.write("Click a matching feature/corner on the overview image.")
+    else:
+        st.write(f"Clicked mosaic: x={pending['mosaic'][0]:.2f}, y={pending['mosaic'][1]:.2f}")
+        st.write(f"Confocal stage: x={pending['stage'][0]:.9f}, y={pending['stage'][1]:.9f}")
+        nx = st.number_input("NanoSIMS X", value=0.0, format="%.6f")
+        ny = st.number_input("NanoSIMS Y", value=0.0, format="%.6f")
+        if st.button("Add anchor"):
+            st.session_state.anchors.append({"mosaic": pending["mosaic"], "stage": pending["stage"], "nanosims": (float(nx), float(ny))})
+            st.session_state.pending_anchor = None
+            st.rerun()
+
+    st.subheader("Anchors")
+    if st.session_state.anchors:
+        anchor_df = pd.DataFrame([
+            {
+                "Anchor": f"A{i}",
+                "Confocal X (m)": fmt(a["stage"][0]),
+                "Confocal Y (m)": fmt(a["stage"][1]),
+                "NanoSIMS X": fmt(a["nanosims"][0], 6),
+                "NanoSIMS Y": fmt(a["nanosims"][1], 6),
+            }
+            for i, a in enumerate(st.session_state.anchors, start=1)
+        ])
+        st.dataframe(anchor_df, use_container_width=True, hide_index=True)
+        remove = st.number_input("Delete anchor number", min_value=1, max_value=len(st.session_state.anchors), value=1, step=1)
+        if st.button("Delete selected anchor"):
+            del st.session_state.anchors[int(remove) - 1]
+            st.rerun()
+    else:
+        st.write("No anchors yet. Add at least 3 anchors.")
+
+st.subheader("Sample coordinates")
+rows = []
+for pid in sorted(positions):
+    pos = positions[pid]
+    stage = pos.get("stage")
+    nano = pos.get("nano")
+    rows.append({
+        "ID": pid,
+        "Confocal X (m)": fmt(stage[0] if stage else None),
+        "Confocal Y (m)": fmt(stage[1] if stage else None),
+        "Z (m)": fmt(pos.get("z")),
+        "NanoSIMS X": fmt(nano[0] if nano else None, 6),
+        "NanoSIMS Y": fmt(nano[1] if nano else None, 6),
+    })
+st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+if len(st.session_state.anchors) < 3:
+    st.warning(f"{len(st.session_state.anchors)} anchor(s). Add at least 3 to calculate NanoSIMS coordinates.")
+else:
+    st.success(f"NanoSIMS coordinates calculated from {len(st.session_state.anchors)} anchors.")
+    output_json = make_output_json(data, st.session_state.anchors, positions, stage_to_nanosims_A)
+    output_name = Path(json_file.name).stem + "_nanosims.json"
+    st.download_button("Download converted JSON", output_json, file_name=output_name, mime="application/json")
