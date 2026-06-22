@@ -20,7 +20,7 @@ let view={scale:1, tx:0, ty:0}; let fitted=false;
 let dragging=false, moved=false, start={x:0,y:0,tx:0,ty:0};
 function send(type,payload={}){window.parent.postMessage({isStreamlitMessage:true,type,...payload},'*')}
 function ready(){send('streamlit:componentReady',{apiVersion:1}); send('streamlit:setFrameHeight',{height:args.height||720})}
-function value(v){send('streamlit:setComponentValue',{value:v})}
+function value(v){send('streamlit:setComponentValue',{value:v,dataType:'json'})}
 function resize(){const r=canvas.getBoundingClientRect(); const d=window.devicePixelRatio||1; canvas.width=Math.max(1,Math.round(r.width*d)); canvas.height=Math.max(1,Math.round(r.height*d)); ctx.setTransform(d,0,0,d,0,0); draw()}
 function fit(){if(!imgReady)return; const w=canvas.clientWidth,h=canvas.clientHeight; view.scale=Math.min(w/img.width,h/img.height); view.tx=(w-img.width*view.scale)/2; view.ty=(h-img.height*view.scale)/2; fitted=true; draw()}
 function screenToImage(x,y){return {x:(x-view.tx)/view.scale,y:(y-view.ty)/view.scale}}
