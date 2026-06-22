@@ -10,10 +10,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageSequence
-from streamlit_plotly_events import plotly_events
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 st.set_page_config(page_title="Overview to NanoSIMS", page_icon="🧭", layout="wide", initial_sidebar_state="expanded")
 
@@ -23,7 +22,7 @@ st.markdown(
     :root {
         --app-bg:#22314d; --sidebar-bg:#293b5c; --panel:#304565; --panel-2:#385071;
         --input-bg:#314867; --hover-bg:#426085; --border:#587096; --text:#f4f7ff;
-        --text-soft:#c6d2e5; --accent:#72aaff; --green:#75e69b;
+        --text-soft:#c6d2e5; --accent:#72aaff;
     }
     html, body, [class*="css"] { color:var(--text); }
     .stApp { color:var(--text); background:radial-gradient(circle at top left,rgba(114,170,255,.16),transparent 38rem),var(--app-bg); }
@@ -51,7 +50,6 @@ st.markdown(
     .stButton>button,.stDownloadButton>button { border-radius:8px; border:1px solid var(--border); background:var(--panel-2); color:var(--text); }
     .stButton>button:hover,.stDownloadButton>button:hover { border-color:var(--accent); background:var(--hover-bg); color:white; }
     .anchor-mode { padding:.65rem .85rem; border:1px solid #d9b632; background:rgba(217,182,50,.14); border-radius:9px; color:#ffe887; }
-    .green-note { color:var(--green); font-weight:650; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -218,23 +216,41 @@ def export_json(data,positions,anchors,matrix):
     return json.dumps(result,indent=2).encode("utf-8")
 
 
-def make_figure(image: Image.Image, positions, stage_to_mosaic, anchors, add_mode: bool):
-    fig=go.Figure()
-    fig.add_trace(go.Image(z=np.asarray(image)))
+def draw_overlays(image: Image.Image, positions, stage_to_mosaic, anchors) -> Image.Image:
+    out = image.copy()
+    draw = ImageDraw.Draw(out)
     if stage_to_mosaic is not None:
-        pts=[]
-        for pid,p in positions.items():
-            if p["stage"] is None: continue
-            x,y=apply_affine(stage_to_mosaic,p["stage"]); pts.append((x,y,pid))
-        if pts:
-            fig.add_trace(go.Scatter(x=[p[0] for p in pts],y=[p[1] for p in pts],mode="markers+text",text=[p[2] for p in pts],textposition="top right",marker=dict(size=8,color="#67d8ff",line=dict(width=1,color="white")),hovertemplate="%{text}<extra></extra>"))
-    if anchors:
-        fig.add_trace(go.Scatter(x=[a["mosaic"][0] for a in anchors],y=[a["mosaic"][1] for a in anchors],mode="markers+text",text=[f"A{i+1}" for i in range(len(anchors))],textposition="top right",textfont=dict(color="#ffe977",size=16),marker=dict(symbol="cross",size=22,color="#ffd84d",line=dict(width=3,color="#ffd84d")),hovertemplate="%{text}<extra></extra>"))
-    fig.update_layout(height=720,margin=dict(l=0,r=0,t=0,b=0),paper_bgcolor="#304565",plot_bgcolor="#304565",dragmode="pan",clickmode="event+select",uirevision="keep-view",showlegend=False)
-    fig.update_xaxes(showgrid=False,zeroline=False,visible=False,range=[0,image.width],constrain="domain")
-    fig.update_yaxes(showgrid=False,zeroline=False,visible=False,range=[image.height,0],scaleanchor="x",scaleratio=1)
-    return fig
+        for pid, p in positions.items():
+            if p["stage"] is None:
+                continue
+            x, y = apply_affine(stage_to_mosaic, p["stage"])
+            draw.ellipse((x-4, y-4, x+4, y+4), outline=(103, 216, 255), width=2)
+            draw.text((x+7, y-12), str(pid), fill=(225, 247, 255))
+    for i, anchor in enumerate(anchors, 1):
+        x, y = anchor["mosaic"]
+        arm = 15
+        draw.line((x-arm, y, x+arm, y), fill=(255, 216, 45), width=4)
+        draw.line((x, y-arm, x, y+arm), fill=(255, 216, 45), width=4)
+        draw.ellipse((x-5, y-5, x+5, y+5), outline=(255, 248, 175), width=2)
+        draw.rectangle((x+12, y-21, x+48, y+2), fill=(42, 51, 68), outline=(255, 216, 45), width=2)
+        draw.text((x+18, y-18), f"A{i}", fill=(255, 235, 111))
+    return out
 
+
+def make_viewport(image: Image.Image, zoom: float, centre_x: float, centre_y: float, display_width: int = 980):
+    zoom = max(1.0, float(zoom))
+    crop_w = max(1, int(image.width / zoom))
+    crop_h = max(1, int(image.height / zoom))
+    cx = int(np.clip(centre_x, crop_w / 2, image.width - crop_w / 2)) if crop_w < image.width else image.width // 2
+    cy = int(np.clip(centre_y, crop_h / 2, image.height - crop_h / 2)) if crop_h < image.height else image.height // 2
+    left = max(0, min(image.width - crop_w, cx - crop_w // 2))
+    top = max(0, min(image.height - crop_h, cy - crop_h // 2))
+    crop = image.crop((left, top, left + crop_w, top + crop_h))
+    shown_w = min(display_width, max(1, crop.width))
+    scale = crop.width / shown_w
+    shown_h = max(1, int(crop.height / scale))
+    shown = crop.resize((shown_w, shown_h), Image.Resampling.LANCZOS)
+    return shown, (left, top), scale
 
 def init_state(data,files,json_name):
     prepared,settings,missing=prepare_tiles(data,files)
@@ -243,6 +259,7 @@ def init_state(data,files,json_name):
     st.session_state.missing_tiles=missing; st.session_state.base_image=render_mosaic(data,prepared,settings)
     st.session_state.positions=get_positions(data); st.session_state.stage_to_mosaic,st.session_state.mosaic_to_stage=get_affines(data)
     st.session_state.anchors=[]; st.session_state.matrix=None; st.session_state.pending_click=None; st.session_state.add_anchor_mode=False
+    st.session_state.zoom_level=1.0; st.session_state.view_centre_x=data.get("mosaic",{}).get("size",[1200,900])[0]/2; st.session_state.view_centre_y=data.get("mosaic",{}).get("size",[1200,900])[1]/2
 
 st.markdown('<div class="app-title">Overview to NanoSIMS Converter</div>',unsafe_allow_html=True)
 st.markdown('<div class="app-subtitle">Browser-based mapping, anchor fitting and coordinate export.</div>',unsafe_allow_html=True)
@@ -289,30 +306,35 @@ if not st.session_state.prepared_tiles:
 left,right=st.columns([1.55,1],gap="large")
 with left:
     st.subheader("Overview")
-    st.caption("Mouse wheel: zoom · drag: pan · double-click: reset view")
-    if st.session_state.add_anchor_mode:
-        st.markdown('<div class="anchor-mode">Add-anchor mode is active. Click the required feature in the overview.</div>',unsafe_allow_html=True)
-    fig=make_figure(st.session_state.base_image,st.session_state.positions,st.session_state.stage_to_mosaic,st.session_state.anchors,st.session_state.add_anchor_mode)
-    clicked=plotly_events(fig,click_event=st.session_state.add_anchor_mode,select_event=False,hover_event=False,override_height=720,key=f"overview_plot_{len(st.session_state.anchors)}")
-    if clicked and st.session_state.add_anchor_mode and st.session_state.mosaic_to_stage is not None:
-        point=clicked[0]
-        # Ignore clicks on overlay traces; image trace is curve 0.
-        if point.get("curveNumber",0)==0:
-            st.session_state.pending_click=(float(point["x"]),float(point["y"])); st.session_state.add_anchor_mode=False; st.rerun()
-    if st.session_state.mosaic_to_stage is None: st.warning("This JSON has no usable `affine_A`; clicks cannot be converted to confocal stage coordinates.")
+    view_controls = st.columns([1.2, 1, 1])
+    zoom = view_controls[0].slider("Zoom", 1.0, 6.0, float(st.session_state.zoom_level), 0.25, key="zoom_control")
+    st.session_state.zoom_level = zoom
+    image_w, image_h = st.session_state.base_image.size
+    centre_x = view_controls[1].number_input("View centre X", min_value=0.0, max_value=float(image_w), value=float(np.clip(st.session_state.view_centre_x,0,image_w)), step=max(1.0,image_w/100), key="centre_x_control")
+    centre_y = view_controls[2].number_input("View centre Y", min_value=0.0, max_value=float(image_h), value=float(np.clip(st.session_state.view_centre_y,0,image_h)), step=max(1.0,image_h/100), key="centre_y_control")
+    st.session_state.view_centre_x, st.session_state.view_centre_y = centre_x, centre_y
+    overlay = draw_overlays(st.session_state.base_image, st.session_state.positions, st.session_state.stage_to_mosaic, st.session_state.anchors)
+    shown, origin, scale = make_viewport(overlay, zoom, centre_x, centre_y)
+    click = streamlit_image_coordinates(shown, width=shown.width, key=f"overview_click_{st.session_state.add_anchor_mode}_{len(st.session_state.anchors)}")
+    if click and st.session_state.add_anchor_mode and st.session_state.mosaic_to_stage is not None:
+        full_xy = (origin[0] + float(click["x"]) * scale, origin[1] + float(click["y"]) * scale)
+        st.session_state.pending_click = full_xy
+        st.session_state.add_anchor_mode = False
+        st.rerun()
+    if st.session_state.mosaic_to_stage is None:
+        st.warning("This JSON has no usable `affine_A`; clicks cannot be converted to confocal stage coordinates.")
 
 with right:
     tabs=st.tabs(["Coordinates","Anchors","Transform"])
     with tabs[0]:
         df=positions_df(st.session_state.positions)
-        def color_nano(val): return "color:#75e69b;font-weight:650" if pd.notna(val) else "color:#9fb0ca"
-        styled=df.style.map(color_nano,subset=["NanoSIMS X","NanoSIMS Y"]).format({"Confocal X (m)":"{:.9f}","Confocal Y (m)":"{:.9f}","Z (m)":"{:.9f}","NanoSIMS X":"{:.6f}","NanoSIMS Y":"{:.6f}"},na_rep="")
+        styled=df.style.format({"Confocal X (m)":"{:.9f}","Confocal Y (m)":"{:.9f}","Z (m)":"{:.9f}","NanoSIMS X":"{:.6f}","NanoSIMS Y":"{:.6f}"},na_rep="")
         st.dataframe(styled,use_container_width=True,height=430,hide_index=True)
-        st.markdown('<span class="green-note">Converted NanoSIMS coordinates are shown in green.</span>',unsafe_allow_html=True)
     with tabs[1]:
         if st.button("＋ Add anchor",type="primary",use_container_width=True,disabled=st.session_state.mosaic_to_stage is None):
             st.session_state.add_anchor_mode=True; st.session_state.pending_click=None; st.rerun()
-        if st.session_state.add_anchor_mode: st.info("Click a feature in the overview to place the next anchor.")
+        if st.session_state.add_anchor_mode:
+            st.markdown('<div class="anchor-mode">Add-anchor mode is active. Click the required feature in the overview.</div>',unsafe_allow_html=True)
         if st.session_state.pending_click is not None and st.session_state.mosaic_to_stage is not None:
             xy=st.session_state.pending_click; stage=apply_affine(st.session_state.mosaic_to_stage,xy)
             st.markdown(f"**New anchor A{len(st.session_state.anchors)+1}**  \nOverview: `{xy[0]:.2f}, {xy[1]:.2f}`  \nConfocal: `{stage[0]:.9f}, {stage[1]:.9f}`")
@@ -325,7 +347,6 @@ with right:
                 st.session_state.anchors.append({"mosaic":xy,"stage":stage,"nanosims":(nx,ny)})
                 st.session_state.matrix=recompute(st.session_state.positions,st.session_state.anchors); st.session_state.pending_click=None; st.rerun()
             if cancel: st.session_state.pending_click=None; st.rerun()
-        if not st.session_state.anchors: st.info("No saved anchors yet.")
         for i,anchor in enumerate(st.session_state.anchors):
             with st.container(border=True):
                 c1,c2=st.columns([4,1]); c1.markdown(f"**A{i+1}**  \nConfocal: `{anchor['stage'][0]:.9f}, {anchor['stage'][1]:.9f}`  \nNanoSIMS: `{anchor['nanosims'][0]:.6f}, {anchor['nanosims'][1]:.6f}`")
