@@ -280,6 +280,31 @@ def activate_add_anchor_mode():
     st.session_state.pending_click = None
 
 
+def apply_display_settings_callback():
+    """Rebuild the mosaic before Streamlit redraws the page.
+
+    Running this as a widget callback keeps the existing sidebar/canvas visible
+    during image recomposition and prevents Streamlit's temporary ghost block.
+    """
+    if "data" not in st.session_state:
+        return
+    draft = []
+    for i in range(2):
+        draft.append({
+            "enabled": bool(st.session_state.get(f"enabled_{i}", True)),
+            "lut": st.session_state.get(f"lut_{i}", ("Green", "Red")[i]),
+            "min": float(st.session_state.get(f"min_{i}", 0.0)),
+            "max": float(st.session_state.get(f"max_{i}", 1.0)),
+        })
+    st.session_state.settings = draft
+    st.session_state.applied_settings = copy.deepcopy(draft)
+    st.session_state.base_image = render_mosaic(
+        st.session_state.data, st.session_state.prepared_tiles, draft
+    )
+    st.session_state.image_data_uri = image_data_uri(st.session_state.base_image)
+    st.session_state.display_update_count = st.session_state.get("display_update_count", 0) + 1
+
+
 st.markdown('<div class="app-title">Overview to NanoSIMS Converter</div>',unsafe_allow_html=True)
 st.markdown('<div class="app-subtitle">Interactive mapping, anchor fitting and coordinate export.</div>',unsafe_allow_html=True)
 
@@ -302,12 +327,11 @@ with st.sidebar:
                 lut=st.selectbox("LUT",list(LUTS),index=list(LUTS).index(cfg["lut"]),key=f"lut_{i}")
                 c1,c2=st.columns(2); lo=c1.number_input("Min",value=float(cfg["min"]),format="%.5g",key=f"min_{i}"); hi=c2.number_input("Max",value=float(cfg["max"]),format="%.5g",key=f"max_{i}")
                 draft.append({"enabled":enabled,"lut":lut,"min":lo,"max":hi})
-            apply_display=st.form_submit_button("Apply display settings",use_container_width=True)
-        if apply_display:
-            st.session_state.settings=draft; st.session_state.applied_settings=copy.deepcopy(draft)
-            st.session_state.base_image=render_mosaic(st.session_state.data,st.session_state.prepared_tiles,draft)
-            st.session_state.image_data_uri=image_data_uri(st.session_state.base_image)
-            st.rerun()
+            st.form_submit_button(
+                "Apply display settings",
+                use_container_width=True,
+                on_click=apply_display_settings_callback,
+            )
         st.caption("Image rendering only runs when this button is pressed.")
         st.divider(); st.subheader("Markers")
         st.session_state.show_anchors = st.checkbox("Show anchors", value=st.session_state.show_anchors, key="show_anchors_control")
