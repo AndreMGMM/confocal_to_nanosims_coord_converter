@@ -26,57 +26,83 @@ st.markdown(
     """
     <style>
     :root {
-        --panel: #121722;
-        --panel-2: #181f2e;
-        --border: #2a3448;
-        --text-soft: #9eabc2;
-        --accent: #4f8cff;
+        --app-bg: #182338;
+        --sidebar-bg: #202d46;
+        --panel: #24334f;
+        --panel-2: #2b3c5c;
+        --input-bg: #263754;
+        --hover-bg: #314665;
+        --border: #415575;
+        --text: #f2f6ff;
+        --text-soft: #b8c5da;
+        --accent: #67a2ff;
     }
+    html, body, [class*="css"] { color: var(--text); }
     .stApp {
-        background:
-          radial-gradient(circle at top left, rgba(79,140,255,.12), transparent 32rem),
-          #0c1018;
+        color: var(--text);
+        background: radial-gradient(circle at top left, rgba(103,162,255,.14), transparent 35rem), var(--app-bg);
     }
-    [data-testid="stSidebar"] {
-        background: #101622;
-        border-right: 1px solid var(--border);
+    [data-testid="stSidebar"] { background: var(--sidebar-bg); border-right: 1px solid var(--border); }
+    [data-testid="stHeader"] { background: rgba(24,35,56,.88); }
+    .block-container { max-width: 1800px; padding-top: 1.2rem; padding-bottom: 2rem; }
+    .app-title { font-size: 1.65rem; font-weight: 750; letter-spacing: -.03em; margin-bottom: .1rem; }
+    .app-subtitle { color: var(--text-soft); margin-bottom: 1rem; }
+
+    /* Inputs, dropdowns, uploaders and pop-up menus */
+    div[data-baseweb="select"] > div,
+    div[data-baseweb="input"] > div,
+    div[data-baseweb="base-input"],
+    div[data-testid="stNumberInput"] input,
+    div[data-testid="stTextInput"] input,
+    div[data-testid="stFileUploaderDropzone"],
+    textarea {
+        background: var(--input-bg) !important;
+        color: var(--text) !important;
+        border-color: var(--border) !important;
     }
-    [data-testid="stHeader"] {
-        background: rgba(12,16,24,.75);
+    div[data-baseweb="popover"],
+    div[data-baseweb="menu"],
+    ul[role="listbox"],
+    li[role="option"] {
+        background: var(--panel-2) !important;
+        color: var(--text) !important;
     }
-    .block-container {
-        max-width: 1800px;
-        padding-top: 1.2rem;
-        padding-bottom: 2rem;
-    }
-    .app-title {
-        font-size: 1.65rem;
-        font-weight: 750;
-        letter-spacing: -0.03em;
-        margin-bottom: .1rem;
-    }
-    .app-subtitle {
-        color: var(--text-soft);
-        margin-bottom: 1rem;
-    }
-    .status-box, .metric-card {
-        background: linear-gradient(180deg, #171e2c, #121824);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: .8rem 1rem;
-    }
+    li[role="option"]:hover, li[aria-selected="true"] { background: var(--hover-bg) !important; }
+    div[data-baseweb="select"] svg, input, textarea { color: var(--text) !important; }
+
+    /* Dataframe/table */
     div[data-testid="stDataFrame"] {
+        background: var(--panel) !important;
         border: 1px solid var(--border);
         border-radius: 10px;
         overflow: hidden;
     }
+    div[data-testid="stDataFrame"] canvas { background: var(--panel) !important; }
+    div[data-testid="stDataFrame"] [role="columnheader"],
+    div[data-testid="stDataFrame"] [role="gridcell"] {
+        background: var(--panel) !important;
+        color: var(--text) !important;
+        border-color: var(--border) !important;
+    }
+
+    /* Tabs, metrics, expanders and containers */
+    [data-testid="stMetric"], [data-testid="stExpander"], div[data-testid="stVerticalBlockBorderWrapper"] {
+        background: rgba(36,51,79,.55);
+        border-color: var(--border) !important;
+        border-radius: 10px;
+    }
+    button[data-baseweb="tab"] { color: var(--text-soft); }
+    button[data-baseweb="tab"][aria-selected="true"] { color: var(--text); }
+
     .stButton > button, .stDownloadButton > button {
         border-radius: 8px;
-        border: 1px solid #34415a;
-        background: #192235;
+        border: 1px solid var(--border);
+        background: var(--panel-2);
+        color: var(--text);
     }
     .stButton > button:hover, .stDownloadButton > button:hover {
         border-color: var(--accent);
+        background: var(--hover-bg);
         color: white;
     }
     </style>
@@ -170,27 +196,55 @@ def composite_to_rgb(raw: bytes, settings: List[dict]) -> Image.Image:
 
 
 def normalized_name(name: str) -> str:
-    return name.replace("\\", "/").split("/")[-1].lower()
+    return name.replace("\\", "/").split("/")[-1].strip().lower()
 
 
-def load_bundle(uploaded) -> Tuple[dict, Dict[str, bytes], str]:
+def add_file_aliases(files: Dict[str, bytes], name: str, raw: bytes) -> None:
+    clean = name.replace("\\", "/").strip().lower()
+    base = normalized_name(clean)
+    files[clean] = raw
+    files[base] = raw
+    files[Path(base).stem.lower()] = raw
+
+
+def resolve_uploaded_file(files: Dict[str, bytes], raw_path: str) -> Optional[bytes]:
+    clean = str(raw_path or "").replace("\\", "/").strip().lower()
+    base = normalized_name(clean)
+    for key in (clean, base, Path(base).stem.lower()):
+        if key in files:
+            return files[key]
+    # Last-resort matching handles renamed folders and duplicate path prefixes.
+    stem = Path(base).stem.lower()
+    for key, value in files.items():
+        key_base = normalized_name(key)
+        if key_base == base or Path(key_base).stem.lower() == stem:
+            return value
+    return None
+
+
+def load_bundle(uploaded_files) -> Tuple[dict, Dict[str, bytes], str]:
     files: Dict[str, bytes] = {}
-    json_name = ""
-    if uploaded.name.lower().endswith(".zip"):
-        with zipfile.ZipFile(io.BytesIO(uploaded.getvalue())) as zf:
-            for info in zf.infolist():
-                if info.is_dir():
-                    continue
-                raw = zf.read(info.filename)
-                files[normalized_name(info.filename)] = raw
-                if info.filename.lower().endswith(".json") and not json_name:
-                    json_name = normalized_name(info.filename)
-        if not json_name:
-            raise ValueError("The ZIP file does not contain a JSON mapping file.")
-        data = json.loads(files[json_name].decode("utf-8"))
-    else:
-        json_name = uploaded.name
-        data = json.loads(uploaded.getvalue().decode("utf-8"))
+    json_candidates: List[str] = []
+    for uploaded in uploaded_files:
+        if uploaded.name.lower().endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(uploaded.getvalue())) as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    raw = zf.read(info.filename)
+                    add_file_aliases(files, info.filename, raw)
+                    if info.filename.lower().endswith(".json"):
+                        json_candidates.append(normalized_name(info.filename))
+        else:
+            raw = uploaded.getvalue()
+            add_file_aliases(files, uploaded.name, raw)
+            if uploaded.name.lower().endswith(".json"):
+                json_candidates.append(normalized_name(uploaded.name))
+    json_candidates = list(dict.fromkeys(json_candidates))
+    if not json_candidates:
+        raise ValueError("Select a mapping JSON, or a ZIP containing one.")
+    json_name = json_candidates[0]
+    data = json.loads(files[json_name].decode("utf-8-sig"))
     return data, files, json_name
 
 
@@ -198,7 +252,7 @@ def initial_channel_settings(data: dict, files: Dict[str, bytes]) -> List[dict]:
     mins, maxs = [[], []], [[], []]
     for tile in (data.get("mosaic") or {}).get("tiles") or []:
         raw_path = str(tile.get("path") or "")
-        raw = files.get(normalized_name(raw_path))
+        raw = resolve_uploaded_file(files, raw_path)
         if raw is None:
             continue
         try:
@@ -248,7 +302,7 @@ def build_overview(data: dict, files: Dict[str, bytes], settings: List[dict]) ->
     loaded = missing = 0
     for tile in mosaic.get("tiles") or []:
         raw_path = str(tile.get("path") or "")
-        raw = files.get(normalized_name(raw_path))
+        raw = resolve_uploaded_file(files, raw_path)
         if raw is None:
             missing += 1
             continue
@@ -357,16 +411,17 @@ st.markdown(
 
 with st.sidebar:
     st.subheader("Project")
-    upload = st.file_uploader(
-        "Mapping JSON or project ZIP",
-        type=["json", "zip"],
-        help="A ZIP should contain the mapping JSON and all referenced image tiles.",
+    uploads = st.file_uploader(
+        "Project files",
+        type=["json", "zip", "tif", "tiff", "png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        help="Select one ZIP, or select the mapping JSON and all referenced image tiles together.",
     )
-    if upload is not None:
-        signature = (upload.name, len(upload.getvalue()))
+    if uploads:
+        signature = tuple(sorted((item.name, len(item.getvalue())) for item in uploads))
         if st.session_state.get("upload_signature") != signature:
             try:
-                data, files, json_name = load_bundle(upload)
+                data, files, json_name = load_bundle(uploads)
                 initialize_state(data, files, json_name)
                 st.session_state.upload_signature = signature
                 st.success("Project loaded")
@@ -393,7 +448,7 @@ with st.sidebar:
             st.rerun()
 
 if "data" not in st.session_state:
-    st.info("Upload the mapping JSON, or preferably a ZIP containing the JSON and its referenced image tiles.")
+    st.info("Upload one ZIP, or select the mapping JSON and all referenced image tiles in the same upload.")
     st.stop()
 
 try:
@@ -411,6 +466,14 @@ status_cols[0].metric("Positions", len(st.session_state.positions))
 status_cols[1].metric("Tiles loaded", loaded)
 status_cols[2].metric("Tiles missing", missing)
 status_cols[3].metric("Anchors", len(st.session_state.anchors))
+
+if loaded == 0:
+    expected = [normalized_name(str(t.get("path") or "")) for t in ((st.session_state.data.get("mosaic") or {}).get("tiles") or [])]
+    expected = [name for name in expected if name]
+    with st.expander("Why is the overview blank?", expanded=True):
+        st.warning("No referenced image tiles were matched. Select the JSON and tile images together, or upload a ZIP containing them.")
+        if expected:
+            st.caption("First expected filenames: " + ", ".join(expected[:8]))
 
 left, right = st.columns([1.55, 1], gap="large")
 
