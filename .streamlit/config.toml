@@ -1,5 +1,9 @@
-[server]
-maxUploadSize = 1024
-
 [theme]
-base = "light"
+base = "dark"
+primaryColor = "#67A2FF"
+backgroundColor = "#182338"
+secondaryBackgroundColor = "#24334F"
+textColor = "#F2F6FF"
+borderColor = "#415575"
+showWidgetBorder = true
+baseRadius = "medium"
