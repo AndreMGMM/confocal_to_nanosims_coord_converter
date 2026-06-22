@@ -216,24 +216,26 @@ def export_json(data,positions,anchors,matrix):
     return json.dumps(result,indent=2).encode("utf-8")
 
 
-def draw_overlays(image: Image.Image, positions, stage_to_mosaic, anchors) -> Image.Image:
+def draw_overlays(image: Image.Image, positions, stage_to_mosaic, anchors, show_rois=True, show_anchors=True) -> Image.Image:
     out = image.copy()
     draw = ImageDraw.Draw(out)
-    if stage_to_mosaic is not None:
+    if show_rois and stage_to_mosaic is not None:
         for pid, p in positions.items():
             if p["stage"] is None:
                 continue
             x, y = apply_affine(stage_to_mosaic, p["stage"])
-            draw.ellipse((x-4, y-4, x+4, y+4), outline=(103, 216, 255), width=2)
-            draw.text((x+7, y-12), str(pid), fill=(225, 247, 255))
-    for i, anchor in enumerate(anchors, 1):
-        x, y = anchor["mosaic"]
-        arm = 15
-        draw.line((x-arm, y, x+arm, y), fill=(255, 216, 45), width=4)
-        draw.line((x, y-arm, x, y+arm), fill=(255, 216, 45), width=4)
-        draw.ellipse((x-5, y-5, x+5, y+5), outline=(255, 248, 175), width=2)
-        draw.rectangle((x+12, y-21, x+48, y+2), fill=(42, 51, 68), outline=(255, 216, 45), width=2)
-        draw.text((x+18, y-18), f"A{i}", fill=(255, 235, 111))
+            draw.ellipse((x-8, y-8, x+8, y+8), outline=(103, 216, 255), width=3)
+            draw.rectangle((x+10, y-23, x+62, y+4), fill=(35, 49, 75), outline=(103, 216, 255), width=2)
+            draw.text((x+16, y-20), str(pid), fill=(235, 250, 255), stroke_width=1, stroke_fill=(0, 0, 0))
+    if show_anchors:
+        for i, anchor in enumerate(anchors, 1):
+            x, y = anchor["mosaic"]
+            arm = 24
+            draw.line((x-arm, y, x+arm, y), fill=(255, 216, 45), width=6)
+            draw.line((x, y-arm, x, y+arm), fill=(255, 216, 45), width=6)
+            draw.ellipse((x-8, y-8, x+8, y+8), outline=(255, 248, 175), width=3)
+            draw.rectangle((x+18, y-31, x+72, y+4), fill=(42, 51, 68), outline=(255, 216, 45), width=3)
+            draw.text((x+27, y-26), f"A{i}", fill=(255, 235, 111), stroke_width=1, stroke_fill=(0, 0, 0))
     return out
 
 
@@ -259,7 +261,7 @@ def init_state(data,files,json_name):
     st.session_state.missing_tiles=missing; st.session_state.base_image=render_mosaic(data,prepared,settings)
     st.session_state.positions=get_positions(data); st.session_state.stage_to_mosaic,st.session_state.mosaic_to_stage=get_affines(data)
     st.session_state.anchors=[]; st.session_state.matrix=None; st.session_state.pending_click=None; st.session_state.add_anchor_mode=False
-    st.session_state.zoom_level=1.0; st.session_state.view_centre_x=data.get("mosaic",{}).get("size",[1200,900])[0]/2; st.session_state.view_centre_y=data.get("mosaic",{}).get("size",[1200,900])[1]/2
+    st.session_state.zoom_level=1.0; st.session_state.show_anchors=True; st.session_state.show_rois=True; st.session_state.last_processed_click=None
 
 st.markdown('<div class="app-title">Overview to NanoSIMS Converter</div>',unsafe_allow_html=True)
 st.markdown('<div class="app-subtitle">Browser-based mapping, anchor fitting and coordinate export.</div>',unsafe_allow_html=True)
@@ -289,9 +291,14 @@ with st.sidebar:
             st.session_state.base_image=render_mosaic(st.session_state.data,st.session_state.prepared_tiles,draft)
             st.rerun()
         st.caption("Image rendering only runs when this button is pressed.")
+        st.divider(); st.subheader("Zoom")
+        st.session_state.zoom_level = st.slider("Magnification", 1.0, 6.0, float(st.session_state.zoom_level), 0.25, key="zoom_control")
+        st.divider(); st.subheader("Markers")
+        st.session_state.show_anchors = st.checkbox("Show anchors", value=st.session_state.show_anchors, key="show_anchors_control")
+        st.session_state.show_rois = st.checkbox("Show ROIs", value=st.session_state.show_rois, key="show_rois_control")
         st.divider()
         if st.button("Clear all anchors",use_container_width=True):
-            st.session_state.anchors=[]; st.session_state.matrix=recompute(st.session_state.positions,[]); st.session_state.pending_click=None; st.session_state.add_anchor_mode=False; st.rerun()
+            st.session_state.anchors=[]; st.session_state.matrix=recompute(st.session_state.positions,[]); st.session_state.pending_click=None; st.session_state.add_anchor_mode=False; st.session_state.last_processed_click=None; st.rerun()
 
 if "data" not in st.session_state:
     st.info("Upload one ZIP, or select the mapping JSON and all referenced image tiles together."); st.stop()
@@ -306,21 +313,26 @@ if not st.session_state.prepared_tiles:
 left,right=st.columns([1.55,1],gap="large")
 with left:
     st.subheader("Overview")
-    view_controls = st.columns([1.2, 1, 1])
-    zoom = view_controls[0].slider("Zoom", 1.0, 6.0, float(st.session_state.zoom_level), 0.25, key="zoom_control")
-    st.session_state.zoom_level = zoom
+    zoom = float(st.session_state.zoom_level)
     image_w, image_h = st.session_state.base_image.size
-    centre_x = view_controls[1].number_input("View centre X", min_value=0.0, max_value=float(image_w), value=float(np.clip(st.session_state.view_centre_x,0,image_w)), step=max(1.0,image_w/100), key="centre_x_control")
-    centre_y = view_controls[2].number_input("View centre Y", min_value=0.0, max_value=float(image_h), value=float(np.clip(st.session_state.view_centre_y,0,image_h)), step=max(1.0,image_h/100), key="centre_y_control")
-    st.session_state.view_centre_x, st.session_state.view_centre_y = centre_x, centre_y
-    overlay = draw_overlays(st.session_state.base_image, st.session_state.positions, st.session_state.stage_to_mosaic, st.session_state.anchors)
-    shown, origin, scale = make_viewport(overlay, zoom, centre_x, centre_y)
-    click = streamlit_image_coordinates(shown, width=shown.width, key=f"overview_click_{st.session_state.add_anchor_mode}_{len(st.session_state.anchors)}")
-    if click and st.session_state.add_anchor_mode and st.session_state.mosaic_to_stage is not None:
-        full_xy = (origin[0] + float(click["x"]) * scale, origin[1] + float(click["y"]) * scale)
-        st.session_state.pending_click = full_xy
-        st.session_state.add_anchor_mode = False
-        st.rerun()
+    overlay = draw_overlays(
+        st.session_state.base_image,
+        st.session_state.positions,
+        st.session_state.stage_to_mosaic,
+        st.session_state.anchors,
+        show_rois=st.session_state.show_rois,
+        show_anchors=st.session_state.show_anchors,
+    )
+    shown, origin, scale = make_viewport(overlay, zoom, image_w / 2, image_h / 2)
+    click = streamlit_image_coordinates(shown, width=shown.width, key="overview_click")
+    if click:
+        click_signature = (round(float(click["x"]), 3), round(float(click["y"]), 3), round(zoom, 2))
+        if st.session_state.add_anchor_mode and click_signature != st.session_state.last_processed_click and st.session_state.mosaic_to_stage is not None:
+            full_xy = (origin[0] + float(click["x"]) * scale, origin[1] + float(click["y"]) * scale)
+            st.session_state.pending_click = full_xy
+            st.session_state.last_processed_click = click_signature
+            st.session_state.add_anchor_mode = False
+            st.rerun()
     if st.session_state.mosaic_to_stage is None:
         st.warning("This JSON has no usable `affine_A`; clicks cannot be converted to confocal stage coordinates.")
 
@@ -328,11 +340,13 @@ with right:
     tabs=st.tabs(["Coordinates","Anchors","Transform"])
     with tabs[0]:
         df=positions_df(st.session_state.positions)
-        styled=df.style.format({"Confocal X (m)":"{:.9f}","Confocal Y (m)":"{:.9f}","Z (m)":"{:.9f}","NanoSIMS X":"{:.6f}","NanoSIMS Y":"{:.6f}"},na_rep="")
+        styled=(df.style
+            .format({"Confocal X (m)":"{:.9f}","Confocal Y (m)":"{:.9f}","Z (m)":"{:.9f}","NanoSIMS X":"{:.6f}","NanoSIMS Y":"{:.6f}"},na_rep="")
+            .set_properties(subset=["NanoSIMS X","NanoSIMS Y"], **{"color":"#72f0a3","font-weight":"700"}))
         st.dataframe(styled,use_container_width=True,height=430,hide_index=True)
     with tabs[1]:
         if st.button("＋ Add anchor",type="primary",use_container_width=True,disabled=st.session_state.mosaic_to_stage is None):
-            st.session_state.add_anchor_mode=True; st.session_state.pending_click=None; st.rerun()
+            st.session_state.add_anchor_mode=True; st.session_state.pending_click=None
         if st.session_state.add_anchor_mode:
             st.markdown('<div class="anchor-mode">Add-anchor mode is active. Click the required feature in the overview.</div>',unsafe_allow_html=True)
         if st.session_state.pending_click is not None and st.session_state.mosaic_to_stage is not None:
