@@ -1,1 +1,43 @@
-
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+html,body{margin:0;padding:0;background:#1f2d46;overflow:hidden;font-family:Arial,sans-serif}
+#wrap{position:relative;width:100%;height:100%;background:#1f2d46;border:1px solid #587096;border-radius:10px;overflow:hidden;box-sizing:border-box}
+canvas{display:block;width:100%;height:100%;cursor:grab;user-select:none;-webkit-user-select:none}
+canvas.anchor-mode{cursor:crosshair}
+#hint{position:absolute;left:12px;bottom:10px;padding:5px 8px;border-radius:6px;background:rgba(22,32,50,.72);color:#d7e2f5;font-size:12px;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="canvas"></canvas><div id="hint">Wheel: zoom · Drag: pan · Double-click: reset</div></div>
+<script>
+const canvas=document.getElementById('canvas');
+const ctx=canvas.getContext('2d');
+let args={}; let img=new Image(); let imgReady=false; let lastImage='';
+let view={scale:1, tx:0, ty:0}; let fitted=false;
+let dragging=false, moved=false, start={x:0,y:0,tx:0,ty:0};
+function send(type,payload={}){window.parent.postMessage({isStreamlitMessage:true,type,...payload},'*')}
+function ready(){send('streamlit:componentReady',{apiVersion:1}); send('streamlit:setFrameHeight',{height:args.height||720})}
+function value(v){send('streamlit:setComponentValue',{value:v})}
+function resize(){const r=canvas.getBoundingClientRect(); const d=window.devicePixelRatio||1; canvas.width=Math.max(1,Math.round(r.width*d)); canvas.height=Math.max(1,Math.round(r.height*d)); ctx.setTransform(d,0,0,d,0,0); draw()}
+function fit(){if(!imgReady)return; const w=canvas.clientWidth,h=canvas.clientHeight; view.scale=Math.min(w/img.width,h/img.height); view.tx=(w-img.width*view.scale)/2; view.ty=(h-img.height*view.scale)/2; fitted=true; draw()}
+function screenToImage(x,y){return {x:(x-view.tx)/view.scale,y:(y-view.ty)/view.scale}}
+function drawLabel(x,y,text,stroke,fill){ctx.font='bold 16px Arial'; const m=ctx.measureText(text); const px=8,py=5; ctx.fillStyle='rgba(35,49,75,.92)'; ctx.strokeStyle=stroke; ctx.lineWidth=2; ctx.beginPath(); ctx.rect(x,y-22,m.width+px*2,26); ctx.fill(); ctx.stroke(); ctx.fillStyle=fill; ctx.fillText(text,x+px,y-4)}
+function draw(){const w=canvas.clientWidth,h=canvas.clientHeight; ctx.clearRect(0,0,w,h); ctx.fillStyle='#1f2d46';ctx.fillRect(0,0,w,h); if(!imgReady)return; ctx.save(); ctx.translate(view.tx,view.ty); ctx.scale(view.scale,view.scale); ctx.drawImage(img,0,0); ctx.restore();
+ const rois=args.rois||[]; if(args.show_rois!==false){for(const r of rois){const sx=view.tx+r.x*view.scale, sy=view.ty+r.y*view.scale; ctx.strokeStyle='#67d8ff';ctx.lineWidth=3;ctx.beginPath();ctx.arc(sx,sy,10,0,Math.PI*2);ctx.stroke(); drawLabel(sx+14,sy-6,String(r.label),'#67d8ff','#effbff')}}
+ const anchors=args.anchors||[]; if(args.show_anchors!==false){anchors.forEach((a,i)=>{const sx=view.tx+a.x*view.scale,sy=view.ty+a.y*view.scale,arm=30;ctx.strokeStyle='#ffd82d';ctx.lineWidth=7;ctx.beginPath();ctx.moveTo(sx-arm,sy);ctx.lineTo(sx+arm,sy);ctx.moveTo(sx,sy-arm);ctx.lineTo(sx,sy+arm);ctx.stroke();ctx.strokeStyle='#fff8af';ctx.lineWidth=3;ctx.beginPath();ctx.arc(sx,sy,10,0,Math.PI*2);ctx.stroke();drawLabel(sx+23,sy-10,'A'+(i+1),'#ffd82d','#ffeb72')})}
+ canvas.classList.toggle('anchor-mode',!!args.add_anchor_mode)
+}
+canvas.addEventListener('wheel',e=>{e.preventDefault(); if(!imgReady)return; const rect=canvas.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top; const before=screenToImage(mx,my); const factor=Math.exp(-e.deltaY*0.0012); view.scale=Math.min(20,Math.max(0.05,view.scale*factor)); view.tx=mx-before.x*view.scale; view.ty=my-before.y*view.scale; draw()},{passive:false});
+canvas.addEventListener('mousedown',e=>{dragging=true;moved=false;start={x:e.clientX,y:e.clientY,tx:view.tx,ty:view.ty};canvas.style.cursor='grabbing'});
+window.addEventListener('mousemove',e=>{if(!dragging)return; const dx=e.clientX-start.x,dy=e.clientY-start.y;if(Math.hypot(dx,dy)>3)moved=true;view.tx=start.tx+dx;view.ty=start.ty+dy;draw()});
+window.addEventListener('mouseup',e=>{if(!dragging)return; dragging=false;canvas.style.cursor=args.add_anchor_mode?'crosshair':'grab'; if(!moved && args.add_anchor_mode){const rect=canvas.getBoundingClientRect();const p=screenToImage(e.clientX-rect.left,e.clientY-rect.top);if(p.x>=0&&p.y>=0&&p.x<=img.width&&p.y<=img.height)value({x:p.x,y:p.y,event_id:Date.now()})}});
+canvas.addEventListener('dblclick',e=>{e.preventDefault();fit()});
+window.addEventListener('resize',resize);
+window.addEventListener('message',event=>{const d=event.data;if(!d||d.type!=='streamlit:render')return;args=d.args||{};document.getElementById('wrap').style.height=(args.height||720)+'px';send('streamlit:setFrameHeight',{height:args.height||720}); if(args.image_data&&args.image_data!==lastImage){lastImage=args.image_data;imgReady=false;img.onload=()=>{imgReady=true;fit();resize()};img.src=args.image_data}else{draw()} });
+ready();
+</script>
+</body>
+</html>
