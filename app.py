@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import io
@@ -11,8 +12,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageDraw, ImageFont, ImageSequence
-from streamlit_image_coordinates import streamlit_image_coordinates
 
 st.set_page_config(page_title="Overview to NanoSIMS", page_icon="🧭", layout="wide", initial_sidebar_state="expanded")
 
@@ -54,6 +55,16 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+_COMPONENT_DIR = Path(__file__).parent / "interactive_canvas"
+interactive_canvas = components.declare_component("interactive_canvas", path=str(_COMPONENT_DIR))
+
+
+def image_data_uri(image: Image.Image) -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True)
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 LUTS = {
     "Green": (0.0, 1.0, 0.0), "Red": (1.0, 0.0, 0.0), "Blue": (0.0, 0.0, 1.0),
@@ -259,12 +270,13 @@ def init_state(data,files,json_name):
     st.session_state.data=data; st.session_state.files=files; st.session_state.json_name=json_name
     st.session_state.prepared_tiles=prepared; st.session_state.settings=settings; st.session_state.applied_settings=copy.deepcopy(settings)
     st.session_state.missing_tiles=missing; st.session_state.base_image=render_mosaic(data,prepared,settings)
+    st.session_state.image_data_uri=image_data_uri(st.session_state.base_image)
     st.session_state.positions=get_positions(data); st.session_state.stage_to_mosaic,st.session_state.mosaic_to_stage=get_affines(data)
     st.session_state.anchors=[]; st.session_state.matrix=None; st.session_state.pending_click=None; st.session_state.add_anchor_mode=False
     st.session_state.zoom_level=1.0; st.session_state.show_anchors=True; st.session_state.show_rois=True; st.session_state.last_processed_click=None
 
 st.markdown('<div class="app-title">Overview to NanoSIMS Converter</div>',unsafe_allow_html=True)
-st.markdown('<div class="app-subtitle">Browser-based mapping, anchor fitting and coordinate export.</div>',unsafe_allow_html=True)
+st.markdown('<div class="app-subtitle">Interactive mapping, anchor fitting and coordinate export.</div>',unsafe_allow_html=True)
 
 with st.sidebar:
     st.subheader("Project")
@@ -289,10 +301,9 @@ with st.sidebar:
         if apply_display:
             st.session_state.settings=draft; st.session_state.applied_settings=copy.deepcopy(draft)
             st.session_state.base_image=render_mosaic(st.session_state.data,st.session_state.prepared_tiles,draft)
+            st.session_state.image_data_uri=image_data_uri(st.session_state.base_image)
             st.rerun()
         st.caption("Image rendering only runs when this button is pressed.")
-        st.divider(); st.subheader("Zoom")
-        st.session_state.zoom_level = st.slider("Magnification", 1.0, 6.0, float(st.session_state.zoom_level), 0.25, key="zoom_control")
         st.divider(); st.subheader("Markers")
         st.session_state.show_anchors = st.checkbox("Show anchors", value=st.session_state.show_anchors, key="show_anchors_control")
         st.session_state.show_rois = st.checkbox("Show ROIs", value=st.session_state.show_rois, key="show_rois_control")
@@ -313,24 +324,33 @@ if not st.session_state.prepared_tiles:
 left,right=st.columns([1.55,1],gap="large")
 with left:
     st.subheader("Overview")
-    zoom = float(st.session_state.zoom_level)
-    image_w, image_h = st.session_state.base_image.size
-    overlay = draw_overlays(
-        st.session_state.base_image,
-        st.session_state.positions,
-        st.session_state.stage_to_mosaic,
-        st.session_state.anchors,
-        show_rois=st.session_state.show_rois,
-        show_anchors=st.session_state.show_anchors,
+    rois = []
+    if st.session_state.stage_to_mosaic is not None:
+        for pid, position in st.session_state.positions.items():
+            if position["stage"] is None:
+                continue
+            x, y = apply_affine(st.session_state.stage_to_mosaic, position["stage"])
+            rois.append({"x": float(x), "y": float(y), "label": str(pid)})
+    anchors_for_viewer = [
+        {"x": float(anchor["mosaic"][0]), "y": float(anchor["mosaic"][1])}
+        for anchor in st.session_state.anchors
+    ]
+    click = interactive_canvas(
+        image_data=st.session_state.image_data_uri,
+        rois=rois,
+        anchors=anchors_for_viewer,
+        show_rois=bool(st.session_state.show_rois),
+        show_anchors=bool(st.session_state.show_anchors),
+        add_anchor_mode=bool(st.session_state.add_anchor_mode),
+        height=720,
+        key="interactive_overview",
+        default=None,
     )
-    shown, origin, scale = make_viewport(overlay, zoom, image_w / 2, image_h / 2)
-    click = streamlit_image_coordinates(shown, width=shown.width, key="overview_click")
-    if click:
-        click_signature = (round(float(click["x"]), 3), round(float(click["y"]), 3), round(zoom, 2))
-        if st.session_state.add_anchor_mode and click_signature != st.session_state.last_processed_click and st.session_state.mosaic_to_stage is not None:
-            full_xy = (origin[0] + float(click["x"]) * scale, origin[1] + float(click["y"]) * scale)
-            st.session_state.pending_click = full_xy
-            st.session_state.last_processed_click = click_signature
+    if click and st.session_state.add_anchor_mode and st.session_state.mosaic_to_stage is not None:
+        event_id = click.get("event_id")
+        if event_id != st.session_state.last_processed_click:
+            st.session_state.pending_click = (float(click["x"]), float(click["y"]))
+            st.session_state.last_processed_click = event_id
             st.session_state.add_anchor_mode = False
             st.rerun()
     if st.session_state.mosaic_to_stage is None:
