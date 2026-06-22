@@ -273,7 +273,12 @@ def init_state(data,files,json_name):
     st.session_state.image_data_uri=image_data_uri(st.session_state.base_image)
     st.session_state.positions=get_positions(data); st.session_state.stage_to_mosaic,st.session_state.mosaic_to_stage=get_affines(data)
     st.session_state.anchors=[]; st.session_state.matrix=None; st.session_state.pending_click=None; st.session_state.add_anchor_mode=False
-    st.session_state.zoom_level=1.0; st.session_state.show_anchors=True; st.session_state.show_rois=True; st.session_state.last_processed_click=None
+    st.session_state.zoom_level=1.0; st.session_state.show_anchors=True; st.session_state.show_rois=True; st.session_state.last_processed_click=None; st.session_state.canvas_height=820
+
+def activate_add_anchor_mode():
+    st.session_state.add_anchor_mode = True
+    st.session_state.pending_click = None
+
 
 st.markdown('<div class="app-title">Overview to NanoSIMS Converter</div>',unsafe_allow_html=True)
 st.markdown('<div class="app-subtitle">Interactive mapping, anchor fitting and coordinate export.</div>',unsafe_allow_html=True)
@@ -307,6 +312,12 @@ with st.sidebar:
         st.divider(); st.subheader("Markers")
         st.session_state.show_anchors = st.checkbox("Show anchors", value=st.session_state.show_anchors, key="show_anchors_control")
         st.session_state.show_rois = st.checkbox("Show ROIs", value=st.session_state.show_rois, key="show_rois_control")
+        st.divider(); st.subheader("Viewer")
+        st.session_state.canvas_height = st.slider(
+            "Canvas height", min_value=600, max_value=1200, value=int(st.session_state.canvas_height), step=20,
+            help="Increase this to make the interactive overview taller. The canvas width automatically follows the browser window."
+        )
+        st.caption("The canvas stretches automatically to the available page width.")
         st.divider()
         if st.button("Clear all anchors",use_container_width=True):
             st.session_state.anchors=[]; st.session_state.matrix=recompute(st.session_state.positions,[]); st.session_state.pending_click=None; st.session_state.add_anchor_mode=False; st.session_state.last_processed_click=None; st.rerun()
@@ -321,7 +332,7 @@ if not st.session_state.prepared_tiles:
         st.warning("No referenced image tiles were matched.")
         if st.session_state.missing_tiles: st.caption("Expected: "+", ".join(st.session_state.missing_tiles[:8]))
 
-left,right=st.columns([1.55,1],gap="large")
+left,right=st.columns([1.85,1],gap="large")
 with left:
     st.subheader("Overview")
     rois = []
@@ -342,7 +353,7 @@ with left:
         show_rois=bool(st.session_state.show_rois),
         show_anchors=bool(st.session_state.show_anchors),
         add_anchor_mode=bool(st.session_state.add_anchor_mode),
-        height=720,
+        height=int(st.session_state.canvas_height),
         key="interactive_overview",
         default=None,
     )
@@ -365,8 +376,11 @@ with right:
             .set_properties(subset=["NanoSIMS X","NanoSIMS Y"], **{"color":"#72f0a3","font-weight":"700"}))
         st.dataframe(styled,use_container_width=True,height=430,hide_index=True)
     with tabs[1]:
-        if st.button("＋ Add anchor",type="primary",use_container_width=True,disabled=st.session_state.mosaic_to_stage is None):
-            st.session_state.add_anchor_mode=True; st.session_state.pending_click=None
+        st.button(
+            "＋ Add anchor", type="primary", use_container_width=True,
+            disabled=st.session_state.mosaic_to_stage is None,
+            on_click=activate_add_anchor_mode,
+        )
         if st.session_state.add_anchor_mode:
             st.markdown('<div class="anchor-mode">Add-anchor mode is active. Click the required feature in the overview.</div>',unsafe_allow_html=True)
         if st.session_state.pending_click is not None and st.session_state.mosaic_to_stage is not None:
